@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# MailCode pre-commit hook — 在提交前运行 ruff lint 检查
+# 启用: git config core.hooksPath .githooks
+
+CHANGED_PY=$(git diff --cached --name-only --diff-filter=ACMR | grep '\.py$' || true)
+
+if [ -z "$CHANGED_PY" ]; then
+    exit 0
+fi
+
+if ! command -v ruff &>/dev/null; then
+    echo "[pre-commit] ruff 未安装，跳过 lint 检查"
+    exit 0
+fi
+
+ruff check $CHANGED_PY

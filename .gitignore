@@ -1,0 +1,94 @@
+# 临时文件
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+
+# 虚拟环境
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+dist/
+# dist-nuitka/ (deprecated - was for Nuitka standalone builds)
+# .nuitka-build-venv/ (deprecated)
+# .nuitka-ccache/ (deprecated)
+build/
+*.spec
+eggs/
+sdist/
+wheels/
+*.egg
+
+# 环境变量 & 密钥
+.env
+.env.*
+credentials.json
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 测试 & 覆盖率
+.coverage
+.coverage.*
+htmlcov/
+.pip-cache/
+.pytest_cache/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+tests/integration/test_config.json
+
+# 运行时数据
+data/
+data/*.json
+
+# 用户便利链接
+user_config.json
+test_config.json
+
+# 日志
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# pyright
+.pyright/
+node_modules/
+package-lock.json
+package.json

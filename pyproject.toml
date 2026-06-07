@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailcode"
+version = "0.3.0"
+description = "Email ↔ AI Agent bidirectional remote command bridge"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.scripts]
+mailcode = "mailcode.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mailcode*"]
+
+[tool.setuptools.package-data]
+mailcode = [
+    "resources/*.json",
+    "resources/*.js",
+]

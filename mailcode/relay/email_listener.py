@@ -1,0 +1,556 @@
+"""IMAP 邮件监听器（简化版 — 仅支持对话路由）"""
+
+import imaplib
+import email
+import json
+import re
+import threading
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from email.header import decode_header
+from email.utils import parseaddr
+
+from mailcode.config import get_imap_config, get_email_config, get_auth_policy, is_session_enabled
+from mailcode.channels.email_channel import EmailChannel
+from mailcode.relay.security import SecurityChecker
+
+if TYPE_CHECKING:
+    from mailcode.relay.conversation_handler import ConversationHandler
+    from mailcode.relay.stateless_handler import StatelessHandler
+
+logger = logging.getLogger("mailcode")
+
+imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
+
+_MAILCODE_HOME = Path.home() / ".config" / "mailcode"
+
+
+class IMAPListener:
+    def __init__(self, imap_config=None, email_config=None, smtp_config=None):
+        self.imap_config = imap_config or get_imap_config()
+        self.email_config = email_config or get_email_config()
+        self.smtp_config = smtp_config
+
+        _MAILCODE_HOME.mkdir(parents=True, exist_ok=True)
+        self.state_path = _MAILCODE_HOME / "state.json"
+
+        self.security_checker = SecurityChecker()
+        self.email_channel = EmailChannel(smtp_config=self.smtp_config, email_config=self.email_config)
+        self._conv_handler: Optional["ConversationHandler"] = None
+        self._stateless_handler: Optional["StatelessHandler"] = None
+
+        self.check_interval = self.email_config.get("check_interval", 5)
+        self.processed_uids: set = set()
+        self.sent_messages: list = []
+        self._load_state()
+
+        self._idle_timeout = 60
+        self._idle_ready = threading.Event()
+        self._idle_mail = None
+        self._idle_thread: Optional[threading.Thread] = None
+        self._mail: Optional[imaplib.IMAP4_SSL] = None
+        self._connected = False
+        self._stopped = threading.Event()
+
+    def stop(self):
+        """向监听循环发出干净退出信号。从信号处理程序调用。"""
+        self._stopped.set()
+        if self._idle_mail is not None:
+            try:
+                self._idle_mail.logout()
+            except Exception:
+                pass
+
+    def _load_state(self):
+        """加载 state.json, 同步 self.processed_uids 和 self.sent_messages。"""
+        if not self.state_path.exists():
+            self.processed_uids = set()
+            self.sent_messages = []
+            return
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.processed_uids = set(data.get("processed_uids", []))
+            self.sent_messages = list(data.get("sent_messages", []))
+        except Exception:
+            self.processed_uids = set()
+            self.sent_messages = []
+
+    def _save_state(self, state: dict):
+        """原子写 state 到 state.json。state 应包含 processed_uids + sent_messages。"""
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+
+    def _prune_old_sent_messages(self):
+        """清理 7 天前的 sent_messages, 限制 processed_uids 上限。"""
+        cutoff = datetime.now() - timedelta(days=7)
+        filtered = []
+        for msg in self.sent_messages:
+            sent_at = msg.get("sent_at", "")
+            if sent_at:
+                try:
+                    msg_time = datetime.fromisoformat(sent_at)
+                    if msg_time > cutoff:
+                        filtered.append(msg)
+                except Exception:
+                    filtered.append(msg)
+        self.sent_messages = filtered
+        if len(self.processed_uids) > 10000:
+            self.processed_uids = set()
+
+    def _init_baseline(self):
+        """建立启动基线：将当前所有 UNSEEN 邮件标记为已处理，后续只响应新邮件"""
+        try:
+            mail = self._connect()
+            mail.select("INBOX")
+            status, messages = mail.search(None, "UNSEEN")
+            if status == "OK" and messages[0]:
+                count = 0
+                for uid_bytes in messages[0].split():
+                    self.processed_uids.add(uid_bytes.decode())
+                    count += 1
+                logger.info(f"邮件基线已建立: {count} 封历史未读邮件不处理")
+            mail.logout()
+        except Exception as e:
+            logger.warning(f"建立邮件基线失败: {e}")
+
+    def _connect(self) -> imaplib.IMAP4_SSL:
+        host = self.imap_config.get("host", "imap.qq.com")
+        port = self.imap_config.get("port", 993)
+        user = self.imap_config.get("user", "")
+        password = self.imap_config.get("pass", "")
+
+        mail = imaplib.IMAP4_SSL(host, port)
+        mail.sock.settimeout(15)
+        # 部分邮件服务商（如网易）要求在登录前发送 ID 指令
+        try:
+            mail._simple_command("ID", '("name" "mailcode" "vendor" "mailcode" "support-email" "' + user + '")')
+        except Exception:
+            pass
+        mail.login(user, password)
+        try:
+            mail._simple_command("ID", '("name" "mailcode" "vendor" "mailcode" "support-email" "' + user + '")')
+        except Exception:
+            pass
+        self._mail = mail
+        self._connected = True
+        return mail
+
+    def _wait_for_idle(self, mail: imaplib.IMAP4_SSL) -> bool:
+        if self._idle_thread and self._idle_thread.is_alive():
+            self._idle_thread.join(timeout=3)
+
+        def idle_thread():
+            try:
+                while self._idle_ready.is_set():
+                    mail.idle()
+                    response = mail.idle_response()
+                    if response:
+                        self._idle_mail = mail
+                        self._idle_ready.clear()
+            except Exception:
+                logger.exception("IDLE 线程异常")
+
+        self._idle_ready.set()
+        self._idle_thread = threading.Thread(target=idle_thread, daemon=True)
+        self._idle_thread.start()
+
+        try:
+            self._idle_ready.wait(timeout=self._idle_timeout)
+        except Exception:
+            pass
+
+        return not self._idle_ready.is_set()
+
+    def _reconnect(self) -> imaplib.IMAP4_SSL:
+        try:
+            self._idle_mail.logout()
+        except Exception:
+            pass
+        self._connected = False
+        # 重建 _idle_ready 事件并 set，让 _wait_for_idle 能重新启动 IDLE 线程
+        self._idle_ready = threading.Event()
+        self._idle_ready.set()
+        return self._connect()
+
+    def _decode_email_header(self, header_value: str) -> str:
+        if not header_value:
+            return ""
+        decoded_parts = []
+        for part, encoding in decode_header(header_value):
+            if isinstance(part, bytes):
+                try:
+                    decoded_parts.append(part.decode(encoding or "utf-8", errors="replace"))
+                except Exception:
+                    decoded_parts.append(part.decode("utf-8", errors="replace"))
+            else:
+                decoded_parts.append(part)
+        return "".join(decoded_parts)
+
+    def _extract_body(self, msg) -> str:
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                if content_type == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        body = payload.decode(charset, errors="replace")
+                        break
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                body = payload.decode(charset, errors="replace")
+        return body
+
+    def _clean_body(self, body: str) -> str:
+        lines = body.split("\n")
+        cleaned_lines = []
+
+        for line in lines:
+            if re.match(r"-+ ?Original Message", line) or re.match(r".* On .* wrote:", line):
+                break
+
+            if line.startswith(">"):
+                continue
+
+            if line.strip().startswith("-- "):
+                break
+
+            if any(greeting in line.lower() for greeting in ["sent from", "best regards", "thanks", "regards", "sincerely"]):
+                if len(line.strip()) < 50:
+                    break
+
+            cleaned_lines.append(line)
+
+        body = "\n".join(cleaned_lines)
+        body = re.sub(r"\n{3,}", "\n\n", body)
+        return body.strip()
+
+    def _is_own_message(self, msg) -> bool:
+        if msg.get("X-MailCode-Remote-Token"):
+            return True
+        if msg.get("X-OpenCode-Remote-Token"):
+            return True
+        return False
+
+    def _is_duplicate(self, msg_id: str, uid: str) -> bool:
+        if uid in self.processed_uids:
+            return True
+
+        for msg in self.sent_messages:
+            if msg.get("message_id") == msg_id:
+                return True
+
+        return False
+
+    def fetch_unread_emails(self, dry_run: bool = False) -> List[Dict]:
+        results = []
+        mail = None
+        try:
+            mail = self._connect()
+            mail.select("INBOX")
+
+            status, messages = mail.search(None, "UNSEEN")
+            if status != "OK":
+                return results
+
+            uids = messages[0].split()
+            if not uids:
+                return results
+
+            for uid_bytes in uids:
+                uid = uid_bytes.decode()
+                status, msg_data = mail.fetch(uid_bytes, "(RFC822)")
+                if status != "OK":
+                    continue
+
+                raw_email = msg_data[0][1]
+                msg = email.message_from_bytes(raw_email)
+
+                msg_id = msg.get("Message-ID", "") or msg.get("Message-Id", "") or uid
+                from_header = self._decode_email_header(msg.get("From", ""))
+                subject = self._decode_email_header(msg.get("Subject", ""))
+                references = msg.get("References", "")
+                in_reply_to = msg.get("In-Reply-To", "")
+
+                if self._is_own_message(msg):
+                    continue
+
+                if self._is_duplicate(msg_id, uid):
+                    continue
+
+                sender_email = parseaddr(from_header)[1].lower() or from_header.lower()
+
+                auth_header = self._decode_email_header(msg.get("Authentication-Results", ""))
+                policy = get_auth_policy()
+                auth_valid, auth_reason = SecurityChecker.verify_auth_results(auth_header, policy)
+                if not auth_valid:
+                    logger.warning(f"邮件认证失败 [{sender_email}]: {auth_reason}")
+                    continue
+                elif auth_reason != "OK":
+                    logger.info(f"邮件认证状态 [{sender_email}]: {auth_reason}")
+
+                if not self.security_checker.is_sender_allowed(sender_email):
+                    continue
+
+                body = self._extract_body(msg)
+                cleaned_body = self._clean_body(body)
+
+                entry = {
+                    "uid": uid,
+                    "message_id": msg_id,
+                    "from": from_header,
+                    "sender_email": sender_email,
+                    "subject": subject,
+                    "body": cleaned_body,
+                    "references": references,
+                    "in_reply_to": in_reply_to,
+                }
+
+                if dry_run:
+                    logger.info(f"DRY RUN - UID: {uid}")
+                    logger.info(f"DRY RUN - From: {from_header}")
+                    logger.info(f"DRY RUN - Subject: {subject}")
+                    logger.info(f"DRY RUN - Auth-Results: {auth_header[:200] if auth_header else '(无)'}")
+                    logger.info(f"DRY RUN - Auth-Status: {auth_reason}")
+                    logger.info(f"DRY RUN - Cleaned Body:\n{cleaned_body[:500]}")
+                    results.append(entry)
+                    continue
+
+                results.append(entry)
+                self.processed_uids.add(uid)
+
+        except Exception as e:
+            logger.error(f"IMAP 监听错误: {e}")
+        finally:
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+
+        return results
+
+    def process_email(self, email_entry: Dict, dry_run: bool = False,
+                      force_session: Optional[bool] = None) -> Tuple[bool, str]:
+        """处理一封邮件: 路由到 conversation / stateless handler。
+
+        路由表:
+            dry_run=True                                       → (True, "dry_run")
+            force_session=True                                 → _handle_via_conversation
+            force_session=False                                → _handle_via_stateless
+            force_session=None + is_session_enabled()=True     → _handle_via_conversation
+            force_session=None + is_session_enabled()=False    → _handle_via_stateless
+
+        Args:
+            email_entry: fetch_unread_emails 产出的 entry dict
+            dry_run: dry-run 模式, 仅日志, 不真发
+            force_session: 显式覆盖 config 中 session.enabled
+
+        Returns:
+            (success: bool, mode: str), mode ∈ {"conversation", "stateless", "dry_run"}
+        """
+        if dry_run:
+            logger.info(
+                f"DRY RUN - 邮件: from={email_entry.get('sender_email')} subject={email_entry.get('subject')}"
+            )
+            return True, "dry_run"
+
+        # 决定走 conversation 还是 stateless
+        if force_session is None:
+            use_conversation = is_session_enabled()
+        else:
+            use_conversation = force_session
+
+        if use_conversation:
+            return self._handle_via_conversation(email_entry)
+        return self._handle_via_stateless(email_entry)
+
+    def _handle_via_conversation(self, email_entry: Dict) -> Tuple[bool, str]:
+        """路由到 ConversationHandler, 处理多轮对话邮件。"""
+        if self._conv_handler is None:
+            from mailcode.relay.conversation_handler import ConversationHandler
+            self._conv_handler = ConversationHandler(
+                email_channel=self.email_channel,
+            )
+
+        success = self._conv_handler.handle_email(
+            from_email=email_entry["sender_email"],
+            subject=email_entry.get("subject", ""),
+            body=email_entry.get("body", ""),
+            references=email_entry.get("references", ""),
+            in_reply_to=email_entry.get("in_reply_to", ""),
+        )
+        mode = "conversation" if success else "conversation_failed"
+        return (success, mode)
+
+    def _handle_via_stateless(self, email_entry: Dict) -> Tuple[bool, str]:
+        """路由到 StatelessHandler, 处理单次回复邮件。
+
+        - ``is_session_enabled()=False`` 时: 走 fallback (新默认)
+        - ``force_session=False`` 时: 显式单次回复 (CLI 调试)
+        """
+        # 提示 fallback 路径, 但仅在"配置没开 session"时 (force_session=False 显式无歧义)
+        if not is_session_enabled():
+            logger.info("session 关闭, 使用单次回复")
+
+        if self._stateless_handler is None:
+            from mailcode.relay.stateless_handler import StatelessHandler
+            self._stateless_handler = StatelessHandler(
+                email_channel=self.email_channel,
+            )
+
+        success = self._stateless_handler.handle_email(
+            from_email=email_entry["sender_email"],
+            subject=email_entry.get("subject", ""),
+            body=email_entry.get("body", ""),
+            references=email_entry.get("references", ""),
+            in_reply_to=email_entry.get("in_reply_to", ""),
+        )
+        mode = "stateless" if success else "stateless_failed"
+        return (success, mode)
+
+    def listen(self, dry_run: bool = False, max_iterations: Optional[int] = None, use_idle: bool = False):
+        mode = "IDLE 长连接" if use_idle else f"轮询({self.check_interval}秒)"
+        print(f"IMAP 监听器启动 ({mode})")
+        if dry_run:
+            print("Dry-run 模式: 仅显示邮件，不注入命令")
+        print("按 Ctrl+C 停止")
+
+        try:
+            if use_idle:
+                self._listen_idle(dry_run, max_iterations)
+            else:
+                self._listen_poll(dry_run, max_iterations)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            print("监听器已停止")
+            if not dry_run:
+                self._save_state({
+                    "processed_uids": list(self.processed_uids),
+                    "sent_messages": self.sent_messages,
+                })
+
+    def _listen_poll(self, dry_run: bool, max_iterations: Optional[int]):
+        if not self.security_checker.config.get("allowed_senders"):
+            logger.warning("发件人白名单为空，所有邮件将被拒绝处理。请在配置文件中设置 allowed_senders")
+        self._init_baseline()
+        self._save_state({
+            "processed_uids": list(self.processed_uids),
+            "sent_messages": self.sent_messages,
+        })
+        iteration = 0
+        while not self._stopped.is_set():
+            iteration += 1
+            if max_iterations and iteration > max_iterations:
+                break
+
+            emails = self.fetch_unread_emails(dry_run=dry_run)
+
+            for email_entry in emails:
+                if dry_run:
+                    continue
+
+                success, message = self.process_email(email_entry, dry_run=dry_run)
+                status_icon = "OK" if success else "FAIL"
+                logger.info(f"{status_icon} {message}")
+
+            if not dry_run:
+                self._save_state({
+                    "processed_uids": list(self.processed_uids),
+                    "sent_messages": self.sent_messages,
+                })
+
+            if self._stopped.wait(timeout=self.check_interval):
+                break
+
+    def _listen_idle(self, dry_run: bool, max_iterations: Optional[int]):
+        if not self.security_checker.config.get("allowed_senders"):
+            logger.warning("发件人白名单为空，所有邮件将被拒绝处理。请在配置文件中设置 allowed_senders")
+        self._init_baseline()
+        self._save_state({
+            "processed_uids": list(self.processed_uids),
+            "sent_messages": self.sent_messages,
+        })
+        mail = self._connect()
+        mail.select("INBOX")
+
+        # 检测服务器是否支持 IMAP IDLE
+        capabilities = getattr(mail, 'capabilities', None) or ()
+        if 'IDLE' not in capabilities:
+            logger.warning("IMAP 服务器不支持 IDLE，自动切换为轮询模式")
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            self._connected = False
+            self._mail = None
+            return self._listen_poll(dry_run, max_iterations)
+
+        iteration = 0
+
+        try:
+            while not self._stopped.is_set():
+                iteration += 1
+                if max_iterations and iteration > max_iterations:
+                    break
+
+                if self._stopped.is_set():
+                    break
+
+                if self._wait_for_idle(mail):
+                    if self._stopped.is_set():
+                        break
+                    mail = self._reconnect()
+                    mail.select("INBOX")
+
+                if self._stopped.is_set():
+                    break
+
+                emails = self.fetch_unread_emails(dry_run=dry_run)
+
+                for email_entry in emails:
+                    if dry_run:
+                        continue
+
+                    success, message = self.process_email(email_entry, dry_run=dry_run)
+                    status_icon = "OK" if success else "FAIL"
+                    logger.info(f"{status_icon} {message}")
+
+                if not dry_run:
+                    self._save_state({
+                        "processed_uids": list(self.processed_uids),
+                        "sent_messages": self.sent_messages,
+                    })
+        finally:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="IMAP 邮件监听器")
+    parser.add_argument("--dry-run", action="store_true", help="仅显示邮件，不注入命令")
+    parser.add_argument("--once", action="store_true", help="只执行一次轮询")
+    parser.add_argument("--idle", action="store_true", help="使用 IMAP IDLE 长连接模式")
+    args = parser.parse_args()
+
+    listener = IMAPListener()
+
+    if args.once:
+        emails = listener.fetch_unread_emails(dry_run=args.dry_run)
+        logger.info(f"发现 {len(emails)} 封新邮件")
+        for email_entry in emails:
+            success, message = listener.process_email(email_entry, dry_run=args.dry_run)
+            logger.info(f"{'OK' if success else 'FAIL'} {message}")
+    else:
+        listener.listen(dry_run=args.dry_run, use_idle=args.idle)

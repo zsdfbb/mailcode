@@ -1,0 +1,36 @@
+{
+  "mailcode_bot": {
+    "_notes": {
+      "email": "MailCode 机器人管理的邮箱地址。MailCode 会监听此邮箱的收件箱，也用此邮箱发信",
+      "password": "邮箱授权码/应用专用密码，不是登录密码。QQ邮箱: 设置→账户→POP3/IMAP→生成授权码",
+      "from_name": "发件人显示名称",
+      "check_interval": "检查新邮件的间隔（秒），默认 5 秒"
+    },
+    "from_name": "Mailcode Remote",
+    "check_interval": 5,
+    "email": "",
+    "password": ""
+  },
+  "security": {
+    "_notes": {
+      "allowed_senders": "哪些邮箱可以给 MailCode 发命令，填你自己的邮箱。多个用逗号分隔。示例: your@qq.com",
+      "auth_policy": "邮件认证策略。warn=仅警告, strict=严格拒绝, off=关闭"
+    },
+    "allowed_senders": [],
+    "auth_policy": "warn"
+  },
+  "session": {
+    "_notes": {
+      "enabled": "是否启用 session 模式",
+      "response_timeout_seconds": "等待 AI 回复的超时时间（秒）",
+      "idle_timeout_hours": "空闲超时时间（小时）",
+      "session_ttl_days": "session 过期天数, 0 或负数不清理",
+      "cleanup_on_startup": "启动时自动清理过期 session"
+    },
+    "enabled": true,
+    "response_timeout_seconds": 180,
+    "idle_timeout_hours": 4,
+    "session_ttl_days": 90,
+    "cleanup_on_startup": true
+  }
+}
