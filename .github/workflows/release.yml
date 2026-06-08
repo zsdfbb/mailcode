@@ -21,3 +21,61 @@ jobs:
       - run: ruff check mailcode/ tests/
       - run: python3 -m pytest tests/unit/ -q
       - run: mypy mailcode/ --ignore-missing-imports || true
+
+  build:
+    name: Build distributions
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install twine
+      - run: twine check dist/*
+      - name: Smoke test
+        run: |
+          pip install dist/*.whl
+          mailcode --help
+      - name: Upload to TestPyPI
+        if: ${{ contains(github.ref, 'rc') || contains(github.ref, 'a1') || contains(github.ref, 'b1') }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          TWINE_REPOSITORY_URL: https://test.pypi.org/legacy/
+        run: |
+          for i in 1 2 3; do
+            twine upload dist/* && break
+            echo "Upload attempt $i failed, retrying..."
+            sleep 5
+          done
+      - name: Upload to PyPI
+        if: ${{ !contains(github.ref, 'rc') && !contains(github.ref, 'a1') && !contains(github.ref, 'b1') }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          for i in 1 2 3; do
+            twine upload dist/* && break
+            echo "Upload attempt $i failed, retrying..."
+            sleep 5
+          done
