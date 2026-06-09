@@ -18,6 +18,31 @@ MailCode 的核心理念是**轻量化的人与 Coding Agent 直连**。
 
 MailCode 不做大而全的平台，只做一件事：**让你用最习惯的方式（邮件）和  Agent 对话。**
 
+## 邮箱账户架构
+
+MailCode 需要 **两个邮箱账户**——一个当 Bot，一个当用户：
+
+- **Bot 邮箱**（例：`mailcode_bot@xxx.com`）—— MailCode 监听它的收件箱，Claude 处理完任务后通过它把结果发回给你
+- **用户邮箱**（你的私人邮箱，例：`your@qq.com`）—— 你从这个邮箱向 Bot 邮箱发邮件下达指令
+
+工作流：
+
+```
+[用户邮箱]  ──发指令邮件──▶  [Bot 邮箱收件箱]
+  your@qq.com                  mailcode_bot@xxx.com
+                                      │
+                                      ▼
+                                 IMAP 监听
+                                      │
+                                      ▼
+                                 Claude 处理
+                                      │
+                                      ▼
+  [用户邮箱]  ◀──回复邮件──  [Bot 邮箱发件箱]
+```
+
+> **为什么是 Bot 邮箱而不是你自己的主邮箱？** MailCode 要登录一个邮箱才能收信和发信，所以需要一个专用 Bot 邮箱；它和你日常使用的邮箱是分开的，配置 `allowed_senders` 限制只有你自己的私人邮箱能给它发指令。
+
 ## 安装
 
 ### 系统依赖
@@ -46,21 +71,21 @@ bash install.sh
 
 ## 配置
 
-编辑 `~/.config/mailcode/config.json`，必填字段：
+编辑 `~/.config/mailcode/config.json`，必填字段。**两个邮箱要分清楚**——`mailcode_bot.email` 是 Bot 邮箱，`security.allowed_senders` 是允许给它发指令的邮箱（通常是你自己的私人邮箱）：
 
 ```jsonc
 {
   "mailcode_bot": {
-    "email": "your@qq.com",       // ← 你的邮箱，MailCode 监听此邮箱收件箱
-    "password": "邮箱授权码"          // ← 不是登录密码！
+    "email": "mailcode_bot@xxx.com",  // ← Bot 邮箱：MailCode 登录此邮箱收信/回信
+    "password": "Bot 邮箱授权码"         // ← Bot 邮箱的授权码，不是登录密码
   },
   "security": {
-    "allowed_senders": ["your@qq.com"]  // 哪些邮箱能发命令？填你自己的
+    "allowed_senders": ["your@qq.com"]  // ← 允许发指令的邮箱（你的私人邮箱）
   }
 }
 ```
 
-SMTP 和 IMAP 配置由系统根据邮箱域名自动识别。支持：QQ 邮箱、163/126 邮箱、Gmail、Outlook/Hotmail。
+SMTP 和 IMAP 配置由系统根据 Bot 邮箱的域名自动识别。支持：QQ 邮箱、163/126 邮箱、Gmail、Outlook/Hotmail。
 
 如需手动覆盖 SMTP/IMAP（如自建邮箱），可添加 `smtp` / `imap` 段，手动设置的值会覆盖自动识别结果。
 
