@@ -76,11 +76,12 @@ bash install.sh
 ```jsonc
 {
   "mailcode_bot": {
-    "email": "mailcode_bot@xxx.com",  // ← Bot 邮箱：MailCode 登录此邮箱收信/回信
-    "password": "Bot 邮箱授权码"         // ← Bot 邮箱的授权码，不是登录密码
+    "email": "mailcode_bot@xxx.com",    // ← Bot 邮箱：MailCode 登录此邮箱收信/回信
+    "password": "Bot 邮箱授权码",          // ← Bot 邮箱的授权码，不是登录密码
+    "check_interval": 60                  // ← 轮询间隔(秒); 163/126 推荐 60-120
   },
   "security": {
-    "allowed_senders": ["your@qq.com"]  // ← 允许发指令的邮箱（你的私人邮箱）
+    "allowed_senders": ["your@qq.com"]    // ← 允许发指令的邮箱（你的私人邮箱）
   }
 }
 ```
@@ -106,15 +107,28 @@ SMTP 和 IMAP 配置由系统根据 Bot 邮箱的域名自动识别。支持：Q
 ### 启动中继
 
 ```bash
-# 前台运行（IDLE 长连接模式）
-mailcode serve --idle
+# 前台运行（默认 IMAP IDLE 长连接, 单连接撑全场, 实时收信）
+mailcode serve
 
-# 干跑模式（仅打印邮件，不调用 claude）
-mailcode serve --idle --dry-run
+# 干跑模式（仅打印邮件, 不调用 claude）
+mailcode serve --dry-run
+
+# 强制走轮询（不用 IDLE; 部分老旧邮箱要求）
+mailcode serve --no-idle
 
 # 单次轮询后退出
 mailcode serve --once
 ```
+
+**IMAP IDLE 支持按邮箱而异**——MailCode 启动时检测 `IMAP CAPABILITY`, 没有 IDLE 就自动回退到轮询:
+
+| 邮箱 | IDLE | 行为 | 推荐 `check_interval` |
+|------|------|------|----------------------|
+| QQ 邮箱 (`imap.qq.com`) | ✅ | 实时推送, 秒级响应 | 60s（轮询时）|
+| 163/126 邮箱 (`imap.163.com` / `imap.126.com`) | ❌ | 自动回退到轮询, warning 日志告知 | **60-120s**（频率过高会被反滥用限速, 严重时封 IP）|
+| Gmail / Outlook | ✅ | 实时推送 | 60s（轮询时）|
+
+网易系邮箱**不支持 IDLE 扩展**, 频繁 IMAP 登录会触发反滥用。Bot 邮箱若用 163/126, 务必把 `mailcode_bot.check_interval` 调到 60-120 秒, 否则几小时内可能被临时封禁。
 
 查看日志：
 
