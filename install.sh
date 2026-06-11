@@ -221,5 +221,5 @@ fi
 log "安装完成！"
 echo ""
 info "启动中继:"
-echo "  mailcode serve --idle"
+echo "  mailcode serve"
 echo ""
