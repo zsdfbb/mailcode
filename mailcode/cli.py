@@ -257,7 +257,8 @@ def build_parser():
         help="启动 IMAP 监听中继 (前台常驻)",
         description=(
             "启动 IMAP 监听中继: 拉取 bot 邮箱里的未读邮件, 注入本地 AI Agent, 把回复通过 SMTP 转发回发件人。\n"
-            "默认使用 IMAP IDLE 长连接 (1 个连接撑全场, 避免被 163 等邮箱的反滥用封 IP)。\n"
+            "默认使用 IMAP IDLE 长连接 (实时推送, 适用于 QQ / Gmail / Outlook)。\n"
+            "126/163 邮箱不支持 IDLE, 自动回退到轮询, 需将 check_interval 调到 60-120 秒避免反滥用。\n"
             "Ctrl-C 退出, 日志写入 ~/.config/mailcode/relay.log。"
         ),
     )
