@@ -116,21 +116,28 @@ class TestListenerLifecycle:
         assert 0.8 <= b.next_delay() <= 2.4  # 1 -> 2 (上一步已 next 一次)
 
     def test_stop_calls_idle_done(self, mock_config_patch):
-        """stop() 在 IDLE-wait 状态调用 idle_done() 立刻打破阻塞"""
+        """stop() 在 IDLE-wait 状态立即打破阻塞; 旧 API 调 idle_done, 新 API 不调."""
+        from mailcode.relay.email_listener import _NEW_IDLE_API
         listener = IMAPListener()
         mock_mail = MagicMock()
         listener._active_idle_mail = mock_mail
 
         listener.stop()
-        mock_mail.idle_done.assert_called_once()
+        if not _NEW_IDLE_API:
+            mock_mail.idle_done.assert_called_once()
+        else:
+            # 新 API: signal handler 不主动打断 IDLE, 由 duration 超时自然返回.
+            mock_mail.idle_done.assert_not_called()
         assert listener._active_idle_mail is None
         assert listener._stopped.is_set()
 
     def test_stop_does_not_crash_when_idle_done_fails(self, mock_config_patch):
         """stop() 容忍 idle_done() 抛异常 (连接可能已经断了)"""
+        from mailcode.relay.email_listener import _NEW_IDLE_API
         listener = IMAPListener()
         mock_mail = MagicMock()
-        mock_mail.idle_done.side_effect = OSError("socket closed")
+        if not _NEW_IDLE_API:
+            mock_mail.idle_done.side_effect = OSError("socket closed")
         listener._active_idle_mail = mock_mail
 
         listener.stop()  # 不应抛

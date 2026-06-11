@@ -26,6 +26,10 @@ logger = logging.getLogger("mailcode")
 
 imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
 
+# Python 3.13+ 把 IMAP IDLE 改成 context manager (`with M.idle() as idler:`),
+# 旧的 `mail.idle_response()` / `mail.idle_done()` 被移除. 这里用特征方法探测.
+_NEW_IDLE_API: bool = not hasattr(imaplib.IMAP4, "idle_response")
+
 _MAILCODE_HOME = Path.home() / ".config" / "mailcode"
 
 
@@ -82,16 +86,22 @@ class IMAPListener:
     def stop(self):
         """向监听循环发出干净退出信号。从信号处理程序调用。
 
-        如果当前阻塞在 IMAP IDLE 上，调用 idle_done() 立刻打破阻塞，
-        让 SIGINT 在 < 1s 内生效。
+        - 旧 imaplib API (<3.13): 主循环在 IDLE 线程里阻塞, 调用
+          `mail.idle_done()` 立刻打破阻塞, SIGINT < 1s 生效.
+        - 新 imaplib API (>=3.13): IDLE 在主线程同步等待 (`with mail.idle()`),
+          旧 `idle_done()` 已移除, signal handler 不能可靠打断 socket read.
+          改成只设 `_stopped`, 由 `_wait_for_idle_new` 的 `duration` 超时
+          自然返回, 然后外层循环检测 `_stopped` 退出. 最长延迟 `_idle_timeout`.
         """
         self._stopped.set()
         if self._active_idle_mail is not None:
-            try:
-                self._active_idle_mail.idle_done()
-            except Exception:
-                pass
+            mail = self._active_idle_mail
             self._active_idle_mail = None
+            if not _NEW_IDLE_API:
+                try:
+                    mail.idle_done()
+                except Exception:
+                    pass
 
     def _load_state(self):
         """加载 state.json, 同步 self.processed_uids 和 self.sent_messages。"""
@@ -183,6 +193,18 @@ class IMAPListener:
         return mail
 
     def _wait_for_idle(self, mail: imaplib.IMAP4_SSL) -> bool:
+        """阻塞等待 IMAP IDLE 事件. 返回 True=收到事件, False=超时/异常.
+
+        按 imaplib 版本分两条路径:
+        - 旧 API: 起一个守护线程跑 `mail.idle()` + `idle_response()`, 主线程 wait event.
+        - 新 API (3.13+): 主线程直接 `with mail.idle(duration=...)` 同步等待,
+          超时由 duration 控制, SIGINT 最多延迟 _idle_timeout 秒.
+        """
+        if _NEW_IDLE_API:
+            return self._wait_for_idle_new(mail)
+        return self._wait_for_idle_old(mail)
+
+    def _wait_for_idle_old(self, mail: imaplib.IMAP4_SSL) -> bool:
         if self._idle_thread and self._idle_thread.is_alive():
             self._idle_thread.join(timeout=3)
 
@@ -207,6 +229,23 @@ class IMAPListener:
             pass
 
         return not self._idle_ready.is_set()
+
+    def _wait_for_idle_new(self, mail: imaplib.IMAP4_SSL) -> bool:
+        """Py3.13+ IDLE 路径: 同步 `with mail.idle(duration=...)` 等待.
+
+        duration 让 IDLE 迭代器在最多 `_idle_timeout` 秒后自然 StopIteration;
+        连接级异常向上抛, 由 `_listen_idle` 的退避循环重连.
+        """
+        try:
+            with mail.idle(duration=self._idle_timeout) as idler:
+                for _typ, _data in idler:
+                    return True
+            return False
+        except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort):
+            raise
+        except Exception:
+            logger.exception("IDLE 异常")
+            return False
 
     def _reconnect(self) -> imaplib.IMAP4_SSL:
         if self._mail is not None:
