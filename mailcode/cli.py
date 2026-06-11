@@ -236,7 +236,7 @@ def build_parser():
             "  2) 编辑授权码 mailcode config path && $EDITOR .../config.json\n"
             "  3) 校验配置   mailcode config validate\n"
             "  4) 自检连通性 mailcode health\n"
-            "  5) 启动中继   mailcode serve --idle          # 长期后台运行\n"
+            "  5) 启动中继   mailcode serve                  # 长期后台运行 (默认 IDLE 长连接)\n"
             "  6) 维护会话   mailcode session list|show|delete|cleanup\n"
             "\n"
             "调试提示:\n"
@@ -257,15 +257,16 @@ def build_parser():
         help="启动 IMAP 监听中继 (前台常驻)",
         description=(
             "启动 IMAP 监听中继: 拉取 bot 邮箱里的未读邮件, 注入本地 AI Agent, 把回复通过 SMTP 转发回发件人。\n"
+            "默认使用 IMAP IDLE 长连接 (1 个连接撑全场, 避免被 163 等邮箱的反滥用封 IP)。\n"
             "Ctrl-C 退出, 日志写入 ~/.config/mailcode/relay.log。"
         ),
     )
     p_serve.add_argument("--dry-run", action="store_true",
                         help="干跑模式: 只打印邮件内容, 不注入 Agent, 不发送回复（用于排查邮件解析）")
     p_serve.add_argument("--once", action="store_true",
-                        help="处理完一轮未读后退出 (用于脚本/调试, 默认持续轮询)")
-    p_serve.add_argument("--idle", action="store_true",
-                        help="使用 IMAP IDLE 长连接, 实时接收新邮件推送 (推荐生产环境使用)")
+                        help="处理完一轮未读后退出 (用于脚本/调试, 默认持续监听)")
+    p_serve.add_argument("--no-idle", action="store_true",
+                        help="禁用 IMAP IDLE 长连接, 改用固定间隔轮询 (默认启用 IDLE)")
     p_serve.add_argument("--session", "-S", action="store_true",
                         help="按邮件主题维护多轮对话 session (覆盖 config 中 session.enabled)")
 

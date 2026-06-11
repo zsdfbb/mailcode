@@ -3,7 +3,9 @@
 import imaplib
 import email
 import json
+import random
 import re
+import socket
 import threading
 import logging
 from datetime import datetime, timedelta
@@ -27,6 +29,30 @@ imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
 _MAILCODE_HOME = Path.home() / ".config" / "mailcode"
 
 
+class _Backoff:
+    """指数退避: 1, 2, 4, 8, 16, 32, 60, 60, ... 秒 + ±20% jitter。
+
+    连接成功时调用 reset() 重置回 1。
+    """
+
+    BASE = 1
+    CAP = 60
+    FACTOR = 2
+    JITTER = 0.2
+
+    def __init__(self):
+        self._n = 0
+
+    def reset(self) -> None:
+        self._n = 0
+
+    def next_delay(self) -> float:
+        base = min(self.CAP, self.BASE * (self.FACTOR ** self._n))
+        self._n += 1
+        spread = base * self.JITTER
+        return base + random.uniform(-spread, spread)
+
+
 class IMAPListener:
     def __init__(self, imap_config=None, email_config=None, smtp_config=None):
         self.imap_config = imap_config or get_imap_config()
@@ -46,22 +72,26 @@ class IMAPListener:
         self.sent_messages: list = []
         self._load_state()
 
-        self._idle_timeout = 60
+        self._idle_timeout = 5
         self._idle_ready = threading.Event()
-        self._idle_mail = None
         self._idle_thread: Optional[threading.Thread] = None
         self._mail: Optional[imaplib.IMAP4_SSL] = None
-        self._connected = False
+        self._active_idle_mail: Optional[imaplib.IMAP4_SSL] = None
         self._stopped = threading.Event()
 
     def stop(self):
-        """向监听循环发出干净退出信号。从信号处理程序调用。"""
+        """向监听循环发出干净退出信号。从信号处理程序调用。
+
+        如果当前阻塞在 IMAP IDLE 上，调用 idle_done() 立刻打破阻塞，
+        让 SIGINT 在 < 1s 内生效。
+        """
         self._stopped.set()
-        if self._idle_mail is not None:
+        if self._active_idle_mail is not None:
             try:
-                self._idle_mail.logout()
+                self._active_idle_mail.idle_done()
             except Exception:
                 pass
+            self._active_idle_mail = None
 
     def _load_state(self):
         """加载 state.json, 同步 self.processed_uids 和 self.sent_messages。"""
@@ -100,6 +130,21 @@ class IMAPListener:
         if len(self.processed_uids) > 10000:
             self.processed_uids = set()
 
+    def _log_connection_error(self, e: Exception, attempt: int, next_delay: Optional[float]) -> None:
+        """结构化输出 IMAP 连接错误, 包含 host:port / 异常类名 / 重试次数 / 下次延迟。"""
+        host = self.imap_config.get("host", "?")
+        port = self.imap_config.get("port", "?")
+        type_name = type(e).__name__
+        if next_delay is not None:
+            logger.error(
+                f"IMAP 连接失败 [{host}:{port}, 尝试 #{attempt}]: "
+                f"{type_name}, {next_delay:.1f}s 后重试"
+            )
+        else:
+            logger.error(
+                f"IMAP 连接失败 [{host}:{port}]: {type_name}: {e}"
+            )
+
     def _init_baseline(self):
         """建立启动基线：将当前所有 UNSEEN 邮件标记为已处理，后续只响应新邮件"""
         try:
@@ -135,7 +180,6 @@ class IMAPListener:
         except Exception:
             pass
         self._mail = mail
-        self._connected = True
         return mail
 
     def _wait_for_idle(self, mail: imaplib.IMAP4_SSL) -> bool:
@@ -165,12 +209,15 @@ class IMAPListener:
         return not self._idle_ready.is_set()
 
     def _reconnect(self) -> imaplib.IMAP4_SSL:
-        try:
-            self._idle_mail.logout()
-        except Exception:
-            pass
-        self._connected = False
-        # 重建 _idle_ready 事件并 set，让 _wait_for_idle 能重新启动 IDLE 线程
+        if self._mail is not None:
+            try:
+                self._mail.logout()
+            except Exception:
+                pass
+            self._mail = None
+        # 先清旧 event，让旧 idle_thread 的 while 循环看到 is_set()==False 后退出
+        self._idle_ready.clear()
+        # 重建 event 并 set，让 _wait_for_idle 能重新启动 IDLE 线程
         self._idle_ready = threading.Event()
         self._idle_ready.set()
         return self._connect()
@@ -248,11 +295,23 @@ class IMAPListener:
 
         return False
 
-    def fetch_unread_emails(self, dry_run: bool = False) -> List[Dict]:
+    def fetch_unread_emails(
+        self,
+        dry_run: bool = False,
+        mail: Optional[imaplib.IMAP4_SSL] = None,
+    ) -> List[Dict]:
+        """拉取未读邮件。
+
+        Args:
+            dry_run: 干跑模式, 仅记录日志, 不更新 processed_uids。
+            mail: 可选已建立的 IMAP 连接。传入时复用 (不负责 logout);
+                  传 None 则本次调用内自建自毁 (适合 --once / 轮询路径)。
+        """
         results = []
-        mail = None
+        owns_connection = mail is None
         try:
-            mail = self._connect()
+            if owns_connection:
+                mail = self._connect()
             mail.select("INBOX")
 
             status, messages = mail.search(None, "UNSEEN")
@@ -325,10 +384,19 @@ class IMAPListener:
                 results.append(entry)
                 self.processed_uids.add(uid)
 
+        except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
+            # 瞬时网络/连接错误, 抛出由上层 _listen_idle 的退避循环处理
+            self._log_connection_error(e, attempt=0, next_delay=None)
+            raise
+        except imaplib.IMAP4.error as e:
+            host = self.imap_config.get("host", "?")
+            logger.error(f"IMAP 协议错误 [{host}]: {e}")
+            raise
         except Exception as e:
-            logger.error(f"IMAP 监听错误: {e}")
+            logger.exception(f"IMAP 监听未知错误: {e}")
+            raise
         finally:
-            if mail is not None:
+            if owns_connection and mail is not None:
                 try:
                     mail.logout()
                 except Exception:
@@ -484,16 +552,24 @@ class IMAPListener:
         # 检测服务器是否支持 IMAP IDLE
         capabilities = getattr(mail, 'capabilities', None) or ()
         if 'IDLE' not in capabilities:
-            logger.warning("IMAP 服务器不支持 IDLE，自动切换为轮询模式")
+            host = self.imap_config.get("host", "?")
+            logger.warning(
+                f"IMAP 服务器 {host} 不支持 IDLE, 自动切换为轮询模式 "
+                f"(check_interval={self.check_interval}s)。"
+            )
+            logger.warning(
+                "如使用 163/126 等不支持 IDLE 的邮箱, 建议把 mailcode_bot.check_interval "
+                "调到 60-120s 以避免触发反滥用频率限制。"
+            )
             try:
                 mail.logout()
             except Exception:
                 pass
-            self._connected = False
             self._mail = None
             return self._listen_poll(dry_run, max_iterations)
 
         iteration = 0
+        backoff = _Backoff()
 
         try:
             while not self._stopped.is_set():
@@ -504,35 +580,66 @@ class IMAPListener:
                 if self._stopped.is_set():
                     break
 
-                if self._wait_for_idle(mail):
+                try:
+                    # 标记当前连接在 IDLE 等待中, 给 stop() 的 idle_done() 用
+                    self._active_idle_mail = mail
+                    got_event = self._wait_for_idle(mail)
+                    self._active_idle_mail = None
+
+                    if got_event:
+                        if self._stopped.is_set():
+                            break
+                        mail = self._reconnect()
+                        mail.select("INBOX")
+
                     if self._stopped.is_set():
                         break
-                    mail = self._reconnect()
-                    mail.select("INBOX")
 
-                if self._stopped.is_set():
+                    # 复用现有连接, 避免每轮 fetch 再开一个 (163 反滥用触发点)
+                    emails = self.fetch_unread_emails(dry_run=dry_run, mail=mail)
+
+                    for email_entry in emails:
+                        if dry_run:
+                            continue
+
+                        success, message = self.process_email(email_entry, dry_run=dry_run)
+                        status_icon = "OK" if success else "FAIL"
+                        logger.info(f"{status_icon} {message}")
+
+                    if not dry_run:
+                        self._save_state({
+                            "processed_uids": list(self.processed_uids),
+                            "sent_messages": self.sent_messages,
+                        })
+
+                    backoff.reset()  # 一轮成功, 退避归零
+
+                except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
+                    # 瞬时错误: 退避后重连
+                    self._active_idle_mail = None
+                    delay = backoff.next_delay()
+                    self._log_connection_error(e, attempt=backoff._n, next_delay=delay)
+                    if self._stopped.wait(timeout=delay):
+                        break
+                    try:
+                        mail = self._reconnect()
+                        mail.select("INBOX")
+                    except imaplib.IMAP4.error as auth_err:
+                        # 重连时再认证失败 = 配置问题, 放弃
+                        logger.error(f"IMAP 认证失败, 放弃重试: {auth_err}")
+                        break
+                except imaplib.IMAP4.error as e:
+                    # 协议级错误 (非瞬时), 不退避直接退出让用户排查
+                    self._active_idle_mail = None
+                    logger.error(f"IMAP 协议错误, 放弃重试: {e}")
                     break
-
-                emails = self.fetch_unread_emails(dry_run=dry_run)
-
-                for email_entry in emails:
-                    if dry_run:
-                        continue
-
-                    success, message = self.process_email(email_entry, dry_run=dry_run)
-                    status_icon = "OK" if success else "FAIL"
-                    logger.info(f"{status_icon} {message}")
-
-                if not dry_run:
-                    self._save_state({
-                        "processed_uids": list(self.processed_uids),
-                        "sent_messages": self.sent_messages,
-                    })
         finally:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+            self._active_idle_mail = None
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

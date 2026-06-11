@@ -34,7 +34,7 @@ def run_serve(args):
                 )
                 logger.info(f"{'✅' if success else '❌'} [{entry.get('token')}] {message}")
         else:
-            listener.listen(dry_run=args.dry_run, use_idle=args.idle)
+            listener.listen(dry_run=args.dry_run, use_idle=not args.no_idle)
     except Exception:
         logger.exception("监听器主循环异常退出")
         sys.exit(1)

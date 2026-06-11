@@ -42,7 +42,7 @@ class TestListenerLifecycle:
         """无 IDLE 能力时回退到 _listen_poll"""
         listener = IMAPListener()
 
-        mock_mail = MagicMock(spec=["capabilities", "select"])
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout"])
         mock_mail.capabilities = ("IMAP4rev1", "LITERAL+")  # 没有 IDLE
         mock_mail.select.return_value = ("OK", [b"1"])
 
@@ -57,7 +57,7 @@ class TestListenerLifecycle:
         """有 IDLE 能力时正常使用 IDLE，不调用回退"""
         listener = IMAPListener()
 
-        mock_mail = MagicMock(spec=["capabilities", "select"])
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "idle_done"])
         mock_mail.capabilities = ("IMAP4rev1", "IDLE", "LITERAL+")
         mock_mail.select.return_value = ("OK", [b"1"])
 
@@ -77,7 +77,7 @@ class TestListenerLifecycle:
 
         listener = IMAPListener()
 
-        mock_mail = MagicMock(spec=["capabilities", "select"])
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout"])
         mock_mail.capabilities = ("IMAP4rev1",)
         mock_mail.select.return_value = ("OK", [b"1"])
 
@@ -98,6 +98,63 @@ class TestListenerLifecycle:
                 listener.listen(dry_run=False, use_idle=False)
 
         mock_save.assert_called_once()
+
+    def test_reconnect_backoff(self, mock_config_patch):
+        """_Backoff 序列 1, 2, 4, 8, 16, 32, 60, 60 ±20% jitter + reset"""
+        from mailcode.relay.email_listener import _Backoff
+
+        b = _Backoff()
+        samples = [b.next_delay() for _ in range(8)]
+        bases = [1, 2, 4, 8, 16, 32, 60, 60]
+        for actual, expected in zip(samples, bases):
+            assert expected * 0.8 <= actual <= expected * 1.2, (
+                f"delay {actual:.2f} not in [{expected*0.8:.2f}, {expected*1.2:.2f}]"
+            )
+
+        b.reset()
+        assert b.next_delay() <= 1.2  # reset 后回到 1 ±20%
+        assert 0.8 <= b.next_delay() <= 2.4  # 1 -> 2 (上一步已 next 一次)
+
+    def test_stop_calls_idle_done(self, mock_config_patch):
+        """stop() 在 IDLE-wait 状态调用 idle_done() 立刻打破阻塞"""
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        listener._active_idle_mail = mock_mail
+
+        listener.stop()
+        mock_mail.idle_done.assert_called_once()
+        assert listener._active_idle_mail is None
+        assert listener._stopped.is_set()
+
+    def test_stop_does_not_crash_when_idle_done_fails(self, mock_config_patch):
+        """stop() 容忍 idle_done() 抛异常 (连接可能已经断了)"""
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        mock_mail.idle_done.side_effect = OSError("socket closed")
+        listener._active_idle_mail = mock_mail
+
+        listener.stop()  # 不应抛
+        assert listener._active_idle_mail is None
+        assert listener._stopped.is_set()
+
+    def test_active_idle_mail_cleared_after_idle_returns(self, mock_config_patch):
+        """_listen_idle 在 _wait_for_idle 返回后清掉 _active_idle_mail (给 stop() 用)"""
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        with patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", return_value=True), \
+             patch.object(listener, "_reconnect", return_value=mock_mail), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]), \
+             patch.object(listener, "_save_state"):
+            listener._stopped.set()  # 立刻退出
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        # 循环退出后, _active_idle_mail 必须被清空
+        assert listener._active_idle_mail is None
 
 
 # ============================================================

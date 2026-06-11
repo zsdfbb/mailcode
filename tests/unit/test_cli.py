@@ -187,13 +187,65 @@ class TestServe:
         class FakeArgs:
             dry_run = True
             once = True
-            idle = False
+            no_idle = True   # 显式走轮询, 避开 IDLE 路径
 
-        with patch("mailcode.relay.email_listener.IMAPListener") as mock_listener:
+        # server.py 顶层 `from ... import IMAPListener`, 必须 patch 它在 server 命名空间里的符号
+        with patch("mailcode.server.IMAPListener") as mock_listener:
             instance = MagicMock()
             instance.fetch_unread_emails.return_value = []
             mock_listener.return_value = instance
             run_serve(FakeArgs())
+
+    def test_serve_default_idle_enabled(self):
+        """serve 默认 no_idle=False (即 IDLE 长连接启用)"""
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        assert args.no_idle is False
+
+    def test_serve_with_no_idle_flag(self):
+        """serve --no-idle 解析为 no_idle=True"""
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--no-idle"])
+        assert args.no_idle is True
+
+    def test_serve_no_idle_passed_to_listener(self, mock_config_patch, temp_data_dir):
+        """run_serve 把 not args.no_idle 传给 listener.listen 的 use_idle"""
+        from mailcode.server import run_serve
+
+        class FakeArgs:
+            dry_run = True
+            once = False     # 走 listen() 分支
+            no_idle = True   # 显式禁用 IDLE
+
+        with patch("mailcode.server.IMAPListener") as mock_listener:
+            instance = MagicMock()
+            instance.fetch_unread_emails.return_value = []
+            mock_listener.return_value = instance
+            instance.listen.return_value = None
+            run_serve(FakeArgs())
+            # 验证 listener.listen 被以 use_idle=False 调用
+            instance.listen.assert_called_once()
+            _, kwargs = instance.listen.call_args
+            assert kwargs.get("use_idle") is False
+
+    def test_serve_default_uses_idle(self, mock_config_patch, temp_data_dir):
+        """不传 --no-idle 时, run_serve 用 use_idle=True (默认 IDLE)"""
+        from mailcode.server import run_serve
+
+        class FakeArgs:
+            dry_run = True
+            once = False    # 走 listen() 分支
+            no_idle = False  # 默认
+
+        with patch("mailcode.server.IMAPListener") as mock_listener:
+            instance = MagicMock()
+            instance.fetch_unread_emails.return_value = []
+            mock_listener.return_value = instance
+            instance.listen.return_value = None
+            run_serve(FakeArgs())
+            instance.listen.assert_called_once()
+            _, kwargs = instance.listen.call_args
+            assert kwargs.get("use_idle") is True
 
     def test_serve_with_session_flag(self):
         """serve --session 应解析为 flag 参数 True"""
@@ -220,7 +272,7 @@ class TestServe:
         class FakeArgs:
             dry_run = False
             once = False
-            idle = False
+            no_idle = False
             session = False
 
         # cmd_serve 内部 `from mailcode.config import validate_serve_config`,
@@ -241,7 +293,7 @@ class TestServe:
         class FakeArgs:
             dry_run = True
             once = True
-            idle = False
+            no_idle = True   # 显式轮询
             session = False
 
         with patch("mailcode.config.validate_serve_config", return_value=[]), \
@@ -257,7 +309,7 @@ class TestServe:
         class FakeArgs:
             dry_run = False
             once = False
-            idle = False
+            no_idle = False
             session = False
 
         with patch("mailcode.config.validate_serve_config", return_value=["err1", "err2"]), \
