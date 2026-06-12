@@ -46,11 +46,16 @@ class StatelessHandler:
         clean_body = strip_cwd(body) if extracted_cwd is not None else body
 
         # 2. 构建 prompt (单次回复: 无 session, 直接给邮件正文)
+        #    用自然语言叙述包装邮件元数据, 避免被 Claude 当成「邮件头模板」
+        #    模仿到回复正文里; 末尾显式禁止生成 From/To/Subject 行和署名邮箱,
+        #    这些字段由 SMTP MIME header 处理, 正文里复述只会冗余。
         prompt = (
-            f"用户最新邮件:\n\n"
-            f"主题: {subject}\n\n"
+            f"你收到了一封邮件, 主题是「{subject}」, 正文如下:\n\n"
             f"{clean_body}\n\n"
-            f"请直接回复这封邮件, 内容将作为邮件正文发送, 用纯文本格式。"
+            "请直接撰写回信的正文内容, 用纯文本格式。"
+            "不要在正文里复述「发件人 / From」「收件人 / To」「主题 / Subject」"
+            "等邮件头字段, 也不要在末尾署名或附上任何邮箱地址 — "
+            "这些会由邮件系统自动添加。"
         )
 
         # 3. 调 claude

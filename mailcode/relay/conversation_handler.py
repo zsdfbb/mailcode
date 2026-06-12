@@ -316,13 +316,22 @@ class ConversationHandler:
     # ------------------------------------------------------------------ #
 
     def _build_prompt(self, session_file_path: str) -> str:
-        """构建极简 prompt, 让 Claude 自助读 session 文件。"""
+        """构建极简 prompt, 让 Claude 自助读 session 文件。
+
+        末尾显式约束: session 文件里的 from/to/subject 字段只是上下文,
+        不要被 Claude 当成"邮件头模板"复述进回复正文; 也不要在末尾署名邮箱
+        —— 这些都已经由 SMTP MIME header 处理, 正文里复述只会冗余。
+        """
         return (
             f"用户最新邮件已写入 session 文件: {session_file_path}\n\n"
             "请用 Read 工具读取该文件, 了解完整对话上下文 "
             "(emails 字段是邮件列表, direction=incoming/outgoing), "
             "然后回复用户最新邮件。\n\n"
             "回复内容将作为邮件正文发送, 请用纯文本格式。"
+            "不要在正文里复述「发件人 / From」「收件人 / To」「主题 / Subject」"
+            "等邮件头字段(session 文件里的 from/to/subject 仅供上下文参考), "
+            "也不要在末尾署名或附上任何邮箱地址 — "
+            "这些会由邮件系统自动添加。"
         )
 
     # ------------------------------------------------------------------ #
