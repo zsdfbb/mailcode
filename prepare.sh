@@ -10,6 +10,9 @@ MAILCODE_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="${MAILCODE_DIR}/.venv"
 REQS_FILE="${MAILCODE_DIR}/requirements-dev.txt"
 
+# 默认使用国内 PyPI 镜像（可通过环境变量覆盖）
+export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
