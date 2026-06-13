@@ -13,6 +13,12 @@ def temp_data_dir(tmp_path):
 
 
 @pytest.fixture
+def schedules_path(temp_data_dir):
+    """临时 schedules.json 路径, 隔离每个测试"""
+    return temp_data_dir / "schedules.json"
+
+
+@pytest.fixture
 def mock_config_full():
     """返回完整内存配置字典（SMTP/IMAP/email/security/notification）"""
     return {

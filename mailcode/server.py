@@ -17,9 +17,35 @@ def run_serve(args):
     """
     listener = IMAPListener()
 
+    # ---- 启动调度器 (--once 模式不启动) ----
+    scheduler = None
+    if not args.once:
+        try:
+            from mailcode.config import get_schedule_config
+            sc = get_schedule_config()
+        except Exception:
+            sc = {}
+        if sc.get("enabled", True):
+            from mailcode.relay.scheduler import Scheduler, ScheduleStore
+            from pathlib import Path
+            sched_path = Path.home() / ".config" / "mailcode" / "schedules.json"
+            sched_store = ScheduleStore(sched_path)
+            scheduler = Scheduler(
+                listener.email_channel,
+                sched_store,
+                dry_run=args.dry_run,
+                tick_seconds=sc.get("tick_seconds", 30),
+            )
+            scheduler.start()
+            logger.info("调度器已启动 (tick=%ss, dry_run=%s)",
+                        sc.get("tick_seconds", 30), args.dry_run)
+    # ---- 结束 ----
+
     def signal_handler(signum, frame):
-        print("\n🛑 收到关闭信号，正在停止监听器...", flush=True)
+        print("\n🛑 收到关闭信号，正在停止...", flush=True)
         listener.stop()
+        if scheduler:
+            scheduler.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -38,3 +64,7 @@ def run_serve(args):
     except Exception:
         logger.exception("监听器主循环异常退出")
         sys.exit(1)
+    finally:
+        if scheduler:
+            scheduler.stop()
+            scheduler.join(timeout=10)

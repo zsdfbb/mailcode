@@ -32,5 +32,17 @@
     "idle_timeout_hours": 4,
     "session_ttl_days": 90,
     "cleanup_on_startup": true
+  },
+  "schedule": {
+    "_notes": {
+      "enabled": "serve 启动时加载并执行定时任务 (默认开启)",
+      "tick_seconds": "调度器主循环 tick 间隔 (秒), 30s 是 1 分钟以内精度的合理值",
+      "max_concurrent": "同时执行的任务上限, 防止多个任务同时调 Claude 占满资源",
+      "missed_run_policy": "错过触发处理策略, v1 仅支持 skip (不补跑)"
+    },
+    "enabled": true,
+    "tick_seconds": 30,
+    "max_concurrent": 1,
+    "missed_run_policy": "skip"
   }
 }

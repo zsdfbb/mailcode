@@ -4,11 +4,11 @@ import logging
 from pathlib import Path
 
 from mailcode.relay.conversation_handler import (
-    call_claude,
     extract_cwd,
     send_error_email,
     strip_cwd,
 )
+from mailcode.utils.claude_runner import call_claude
 
 logger = logging.getLogger(__name__)
 

@@ -674,3 +674,69 @@ MailCode/
 
 - `claude` — Claude Code CLI (必需, 通过 `claude -p ... --dangerously-skip-permissions` 调用)
 - `launchd` / `systemd` — 系统服务管理 (macOS / Linux 守护进程, 可选)
+
+---
+
+## 11. Schedule 定时任务
+
+> Section 11 — 2026-06-13 新增。在 `mailcode serve` 守护进程里挂一个 Scheduler 线程, 按配置主动触发 Claude 调用并通过 SMTP 发结果邮件。
+
+### 11.1 整体架构
+
+```
+mailcode serve 进程
+├── IMAPListener 线程            ← 邮件监听 (既有的)
+└── Scheduler 线程               ← 新增: 定时任务
+    ├── 每 30s tick 扫一次 schedules.json
+    ├── ScheduleStore.RLock → tmp+replace 原子写
+    ├── 到期 → call_claude(prompt, cwd)
+    └── 完成 → EmailChannel.send_reply(to_email, subject, body)
+```
+
+关键约束:
+- `--once` 模式不启动 Scheduler
+- `--dry-run` 透传, 调度照常但不发邮件
+- Scheduler 与 IMAPListener 共享 `EmailChannel` 单例
+- signal_handler 同步停两个线程, finally 中 join(timeout=10) 兜底
+
+### 11.2 调度类型 (4 种)
+
+| Type | 字段 | `compute_next_run` 算法 |
+|------|------|------------------------|
+| `interval` | `interval_seconds: int` | `after + interval_seconds` |
+| `daily` | `time: HH:MM` | 找 after 后第一个 HH:MM |
+| `weekly` | `day_of_week: 0-6` + `time` | 按 day_of_week 偏移, 若今天已过推 7 天 |
+| `monthly` | `day_of_month: 1-31` + `time` | 试 (year, month, day), 无此日则跳到下个月 |
+
+错过策略: skip (不补跑), 用 `mailcode schedule run-now <name>` 手动补。
+
+### 11.3 存储模型
+
+文件 `~/.config/mailcode/schedules.json`:
+- 顶层: `{"_version": 1, "tasks": [...]}`
+- Task schema: id / name / enabled / schedule / prompt / cwd / to_email / subject_prefix / last_* / next_run_at / created_at / updated_at
+- 读写安全: `threading.RLock` + tmp + `os.replace` 原子写
+- 无跨进程锁 (v1 不支持多 serve 实例并发)
+
+### 11.4 CLI 子命令
+
+| 命令 | 用途 |
+|------|------|
+| `mailcode schedule list` | 表格列出所有任务 |
+| `mailcode schedule show <name>` | 单个任务详情 |
+| `mailcode schedule add <name> --type ... --prompt ... --to-email ...` | 新增 |
+| `mailcode schedule enable <name>` / `disable <name>` | 启用/禁用 |
+| `mailcode schedule delete <name>` | 删除 (确认/--yes) |
+| `mailcode schedule run-now <name>` | 立即执行 (不开 serve) |
+| `mailcode schedule validate` | 校验完整性 |
+
+### 11.5 关键设计决策
+
+| 决策 | v1 做法 | 理由 |
+|------|---------|------|
+| 错过触发 | skip | 启动时重算 next_run_at; 补跑用 run-now |
+| 任务堆积 | max_concurrent=1, running flag | 串行, 到期的跳过 |
+| 时区 | 本地时间 + ISO8601 带 offset | 与现有风格一致 |
+| 与 session 隔离 | 不写 session | 一次邮件, 不走 IMAP 路由 |
+| call_claude 超时 | 300s | 不暴露 per-task timeout |
+| 文件损坏 | 启动 warn + 空任务 | 不静默修复 |

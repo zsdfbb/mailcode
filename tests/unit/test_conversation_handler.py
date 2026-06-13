@@ -1,7 +1,6 @@
 """ConversationHandler 单元测试 —— 覆盖 session-per-file 新 API"""
 
 import json
-import subprocess
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,6 +13,7 @@ from mailcode.relay.conversation_handler import (
     extract_cwd,
     strip_cwd,
 )
+from mailcode.utils import claude_runner as cr_module
 
 
 # ------------------------------------------------------------------ #
@@ -59,108 +59,6 @@ def _make_handler(channel, conv_dir):
 
 
 # ------------------------------------------------------------------ #
-# _call_claude
-# ------------------------------------------------------------------ #
-
-
-class TestCallClaude:
-    """claude -p 子进程调用测试。"""
-
-    def test_success(self, handler):
-        """成功调用返回 stdout.strip()。"""
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "  Hello, world!  \n"
-        mock_result.stderr = ""
-
-        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
-            result = ch_module.call_claude("test prompt")
-
-        assert result == "Hello, world!"
-        mock_run.assert_called_once()
-        args, kwargs = mock_run.call_args
-        assert args[0] == [
-            "claude",
-            "-p",
-            "test prompt",
-            "--dangerously-skip-permissions",
-        ]
-        assert kwargs["capture_output"] is True
-        assert kwargs["text"] is True
-        assert kwargs["timeout"] == 300
-        # 默认 cwd 应该是 Path.home()
-        assert kwargs["cwd"] == str(Path.home())
-
-    def test_nonzero_exit(self, handler):
-        """返回码非 0 时返回 None。"""
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stderr = "error occurred"
-        mock_result.stdout = ""
-
-        with patch.object(subprocess, "run", return_value=mock_result):
-            result = ch_module.call_claude("test")
-
-        assert result is None
-
-    def test_timeout(self, handler):
-        """TimeoutExpired 时返回 None。"""
-        with patch.object(
-            subprocess, "run",
-            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=300),
-        ):
-            result = ch_module.call_claude("test")
-
-        assert result is None
-
-    def test_file_not_found(self, handler):
-        """claude 命令不存在时返回 None。"""
-        with patch.object(subprocess, "run", side_effect=FileNotFoundError()):
-            result = ch_module.call_claude("test")
-
-        assert result is None
-
-    def test_cwd_fallback(self, handler):
-        """cwd 为空时回退到 Path.home()。"""
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "ok"
-        mock_result.stderr = ""
-
-        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
-            result = ch_module.call_claude("test", cwd="")
-
-        assert result == "ok"
-        _, kwargs = mock_run.call_args
-        assert kwargs["cwd"] == str(Path.home())
-
-    def test_cwd_propagated(self, handler):
-        """传入 cwd 时传递给 subprocess。"""
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "ok"
-        mock_result.stderr = ""
-
-        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
-            ch_module.call_claude("test", cwd="/tmp")
-
-        _, kwargs = mock_run.call_args
-        assert kwargs["cwd"] == "/tmp"
-
-    def test_module_level_call_claude_signature(self):
-        """call_claude 是模块级函数, 可独立导入, 不依赖 handler 实例。"""
-        import inspect
-        # 函数定义在 conversation_handler 模块级
-        assert callable(ch_module.call_claude)
-        sig = inspect.signature(ch_module.call_claude)
-        # 必须有 prompt 与 cwd 两个参数
-        params = list(sig.parameters.keys())
-        assert "prompt" in params
-        assert "cwd" in params
-        # 旧的方法不存在于 ConversationHandler 类上
-        assert not hasattr(ConversationHandler, "_call_claude")
-
-
 # ------------------------------------------------------------------ #
 # Session IO
 # ------------------------------------------------------------------ #
@@ -477,7 +375,7 @@ class TestHandleEmail:
         """第一封邮件 → 新 session, 存盘, index 更新。"""
         mock_email_channel.send_reply.return_value = (True, "<sent-1@mailcode>")
 
-        with patch.object(ch_module, "call_claude", return_value="回复内容"):
+        with patch.object(cr_module, "call_claude", return_value="回复内容"):
             result = handler.handle_email(
                 from_email="user@test.com",
                 subject="Hello",
@@ -505,7 +403,7 @@ class TestHandleEmail:
         """In-Reply-To 命中, 续接同一 session。"""
         # 先建一个 session + outgoing msg_id
         mock_email_channel.send_reply.return_value = (True, "<prev@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="first reply"):
+        with patch.object(cr_module, "call_claude", return_value="first reply"):
             handler.handle_email(
                 from_email="user@test.com",
                 subject="Hi",
@@ -515,7 +413,7 @@ class TestHandleEmail:
 
         # 第二封邮件 In-Reply-To 指向上次 outgoing
         mock_email_channel.send_reply.return_value = (True, "<next@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="second reply"):
+        with patch.object(cr_module, "call_claude", return_value="second reply"):
             result = handler.handle_email(
                 from_email="user@test.com",
                 subject="Re: Hi",
@@ -539,7 +437,7 @@ class TestHandleEmail:
             ],
         })
 
-        with patch.object(ch_module, "call_claude", return_value="ok"):
+        with patch.object(cr_module, "call_claude", return_value="ok"):
             result = handler.handle_email(
                 from_email="user@test.com",
                 subject="Re: X",
@@ -557,7 +455,7 @@ class TestHandleEmail:
         d = tmp_path / "project"
         d.mkdir()
         mock_email_channel.send_reply.return_value = (True, "<c@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r") as mc:
+        with patch.object(cr_module, "call_claude", return_value="r") as mc:
             handler.handle_email(
                 from_email="u@t.com",
                 subject="Hi",
@@ -579,14 +477,14 @@ class TestHandleEmail:
         d.mkdir()
         # 第一封
         mock_email_channel.send_reply.return_value = (True, "<s1@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="Hi", body=f"cwd: {d}\nq1",
             )
         sid = handler.list_sessions()[0]["session_id"]
         # 第二封 (无 cwd)
         mock_email_channel.send_reply.return_value = (True, "<s2@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r") as mc:
+        with patch.object(cr_module, "call_claude", return_value="r") as mc:
             handler.handle_email(
                 from_email="u@t.com",
                 subject="Re: Hi",
@@ -604,12 +502,12 @@ class TestHandleEmail:
         d2 = tmp_path / "second"
         d2.mkdir()
         mock_email_channel.send_reply.return_value = (True, "<o1@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="Hi", body=f"cwd: {d1}\nq",
             )
         mock_email_channel.send_reply.return_value = (True, "<o2@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r") as mc:
+        with patch.object(cr_module, "call_claude", return_value="r") as mc:
             handler.handle_email(
                 from_email="u@t.com",
                 subject="Re: Hi",
@@ -620,7 +518,7 @@ class TestHandleEmail:
 
     def test_claude_failure_sends_error_email(self, handler, mock_email_channel):
         """claude 返回 None → 发送"技术问题"错误邮件。"""
-        with patch.object(ch_module, "call_claude", return_value=None):
+        with patch.object(cr_module, "call_claude", return_value=None):
             result = handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )
@@ -635,7 +533,7 @@ class TestHandleEmail:
 
     def test_claude_failure_does_not_save_outgoing(self, handler, mock_email_channel):
         """claude 失败时 session 不应包含 outgoing 邮件。"""
-        with patch.object(ch_module, "call_claude", return_value=None):
+        with patch.object(cr_module, "call_claude", return_value=None):
             handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )
@@ -647,7 +545,7 @@ class TestHandleEmail:
 
     def test_empty_response_sends_error_email(self, handler, mock_email_channel):
         """claude 返回 "" → 发送"没有回复内容"错误邮件。"""
-        with patch.object(ch_module, "call_claude", return_value=""):
+        with patch.object(cr_module, "call_claude", return_value=""):
             result = handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )
@@ -664,7 +562,7 @@ class TestHandleEmail:
         对纯空白字符串会原样发出 (Claude 端负责处理)。
         """
         mock_email_channel.send_reply.return_value = (True, "<w@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="   \n  "):
+        with patch.object(cr_module, "call_claude", return_value="   \n  "):
             result = handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )
@@ -676,7 +574,7 @@ class TestHandleEmail:
     def test_smtp_failure_still_saves_session(self, handler, mock_email_channel):
         """SMTP 失败时 session.emails 仍包含 outgoing, 返回 False。"""
         mock_email_channel.send_reply.return_value = (False, None)
-        with patch.object(ch_module, "call_claude", return_value="reply body"):
+        with patch.object(cr_module, "call_claude", return_value="reply body"):
             result = handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )
@@ -691,7 +589,7 @@ class TestHandleEmail:
     def test_smtp_failure_msg_id_empty(self, handler, mock_email_channel):
         """SMTP 失败时 outgoing.msg_id 留空。"""
         mock_email_channel.send_reply.return_value = (False, None)
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )
@@ -702,7 +600,7 @@ class TestHandleEmail:
     def test_outgoing_msg_id_from_send_reply(self, handler, mock_email_channel):
         """outgoing.msg_id = send_reply 返回的 our_msg_id。"""
         mock_email_channel.send_reply.return_value = (True, "<custom-id@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )
@@ -715,7 +613,7 @@ class TestHandleEmail:
     def test_subject_re_prefix_added(self, handler, mock_email_channel):
         """无 Re: 时自动加。"""
         mock_email_channel.send_reply.return_value = (True, "<x@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="New Topic", body="q",
             )
@@ -724,7 +622,7 @@ class TestHandleEmail:
     def test_subject_re_prefix_not_duplicated(self, handler, mock_email_channel):
         """已有 Re: 时不再加。"""
         mock_email_channel.send_reply.return_value = (True, "<y@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="Re: Topic", body="q",
             )
@@ -733,7 +631,7 @@ class TestHandleEmail:
     def test_in_reply_to_passed_through(self, handler, mock_email_channel):
         """references / in_reply_to 透传给 send_reply。"""
         mock_email_channel.send_reply.return_value = (True, "<z@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com",
                 subject="Re: T",
@@ -747,7 +645,7 @@ class TestHandleEmail:
 
     def test_error_email_in_reply_to_passed(self, handler, mock_email_channel):
         """错误邮件的 in_reply_to = 用户的 in_reply_to 参数。"""
-        with patch.object(ch_module, "call_claude", return_value=None):
+        with patch.object(cr_module, "call_claude", return_value=None):
             handler.handle_email(
                 from_email="u@t.com",
                 subject="Hi",
@@ -762,12 +660,12 @@ class TestHandleEmail:
     def test_no_in_reply_to_creates_new(self, handler, mock_email_channel):
         """in_reply_to 为空时新建 session。"""
         mock_email_channel.send_reply.return_value = (True, "<n1@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="A", body="a",
             )
         mock_email_channel.send_reply.return_value = (True, "<n2@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="B", body="b",
             )
@@ -883,7 +781,7 @@ class TestTerminateSession:
         """终止 session 时, index 中所有该 session 的 msg_id 都清掉。"""
         # 建一个 session, 触发 outgoing 后 index 有 msg_id
         mock_email_channel.send_reply.return_value = (True, "<out1@mailcode>")
-        with patch.object(ch_module, "call_claude", return_value="r"):
+        with patch.object(cr_module, "call_claude", return_value="r"):
             handler.handle_email(
                 from_email="u@t.com", subject="Hi", body="q",
             )

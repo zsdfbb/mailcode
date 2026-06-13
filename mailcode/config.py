@@ -197,6 +197,22 @@ def is_session_enabled() -> bool:
     return get_session_config().get("enabled", True)
 
 
+SCHEDULE_DEFAULTS = {
+    "enabled": True,
+    "tick_seconds": 30,
+    "max_concurrent": 1,
+    "missed_run_policy": "skip",  # v1 仅支持 skip, v2 加 run_immediately
+}
+
+
+def get_schedule_config() -> Dict[str, Any]:
+    config = load_config()
+    raw = config.get("schedule", {})
+    result = dict(SCHEDULE_DEFAULTS)
+    result.update(raw)
+    return result
+
+
 def validate_serve_config() -> list[str]:
     """校验 serve 启动所需配置项, 返回错误消息列表 (空列表 = 通过)。
 
@@ -241,6 +257,16 @@ def validate_serve_config() -> list[str]:
         allowed = security.get("allowed_senders", [])
         if not allowed:
             errors.append("security.allowed_senders 为空（至少应包含自己的邮箱）")
+
+        # schedule 段可选校验 (warn 而非阻塞)
+        schedule_cfg = config.get("schedule", {})
+        if schedule_cfg.get("enabled", True):
+            tick = schedule_cfg.get("tick_seconds", 30)
+            if not isinstance(tick, int) or tick <= 0:
+                errors.append(f"schedule.tick_seconds 应为正整数, 当前: {tick}")
+            max_c = schedule_cfg.get("max_concurrent", 1)
+            if not isinstance(max_c, int) or max_c < 1:
+                errors.append(f"schedule.max_concurrent 应为 >=1 整数, 当前: {max_c}")
     except Exception as e:
         logger.warning(f"配置校验过程中出错: {e}")
         errors.append(f"配置校验失败: {e}")

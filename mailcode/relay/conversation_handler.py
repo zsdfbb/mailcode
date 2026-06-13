@@ -3,11 +3,12 @@
 import json
 import logging
 import re
-import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
+
+from mailcode.utils import claude_runner as cr_module
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +24,6 @@ _CWD_RE = re.compile(r"^cwd:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 
 # 默认 session TTL (天), 0 或负数 = 不清理
 _DEFAULT_TTL_DAYS = 90
-
-# claude -p 子进程超时
-_CLAUDE_TIMEOUT = 300
 
 
 # ------------------------------------------------------------------ #
@@ -62,34 +60,6 @@ def strip_cwd(body: str) -> str:
     if not body:
         return body
     return _CWD_RE.sub("", body).strip()
-
-
-def call_claude(prompt: str, cwd: str = "") -> Optional[str]:
-    """调用 ``claude -p`` 子进程。失败返回 None。
-
-    Args:
-        prompt: 完整 prompt
-        cwd: 工作目录 (默认 ``Path.home()``)
-    """
-    cwd = cwd or str(Path.home())
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--dangerously-skip-permissions"],
-            capture_output=True,
-            text=True,
-            timeout=_CLAUDE_TIMEOUT,
-            cwd=cwd,
-        )
-        if result.returncode != 0:
-            logger.error("claude -p 失败: %s", result.stderr[:500])
-            return None
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        logger.error("claude -p 超时")
-        return None
-    except FileNotFoundError:
-        logger.error("claude 命令未找到, 请确保已安装 Claude Code")
-        return None
 
 
 def send_error_email(email_channel, from_email: str, subject: str, body: str,
@@ -453,7 +423,7 @@ class ConversationHandler:
         session_path = str(self._session_path(session_id))
         prompt = self._build_prompt(session_path)
         cwd = session.get("cwd") or str(Path.home())
-        response = call_claude(prompt, cwd=cwd)
+        response = cr_module.call_claude(prompt, cwd=cwd)
 
         # 7. claude 失败 → 写日志 + 发邮件通知用户
         if response is None:

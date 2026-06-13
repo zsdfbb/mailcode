@@ -77,6 +77,68 @@ def _build_session_handler():
     return ConversationHandler(email_channel=channel)
 
 
+def _build_schedule_store():
+    """构造 ScheduleStore 实例（默认路径 ~/.config/mailcode/schedules.json）。"""
+    from pathlib import Path
+
+    schedules_path = Path.home() / ".config" / "mailcode" / "schedules.json"
+    from mailcode.relay.scheduler import ScheduleStore
+    return ScheduleStore(schedules_path)
+
+
+def cmd_schedule(args):
+    """schedule 子命令: list/show/add/enable/disable/delete/run-now/validate。"""
+    from mailcode.schedule_cli import (
+        cmd_schedule_list, cmd_schedule_show, cmd_schedule_add,
+        cmd_schedule_enable, cmd_schedule_disable, cmd_schedule_delete,
+        cmd_schedule_run_now, cmd_schedule_validate,
+    )
+    sub = getattr(args, "schedule_command", None)
+    if sub is None:
+        print("用法: mailcode schedule <list|show|add|enable|disable|delete|run-now|validate>", file=sys.stderr)
+        sys.exit(1)
+
+    store = _build_schedule_store()
+
+    if sub == "list":
+        cmd_schedule_list(store)
+    elif sub == "show":
+        cmd_schedule_show(store, args.name)
+    elif sub == "add":
+        # 把 CLI 的 "mon" 字符串转为 int(0)，与 parse_schedule 的整数 api 一致
+        _DOW_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+        cmd_schedule_add(store, args.name,
+            schedule_type=args.type,
+            interval_seconds=args.interval_seconds,
+            time=args.time,
+            day_of_week=_DOW_MAP.get(args.day_of_week) if args.day_of_week else None,
+            day_of_month=args.day_of_month,
+            prompt=args.prompt,
+            to_email=args.to_email,
+            cwd=args.cwd,
+            subject_prefix=args.subject_prefix,
+            interactive=False,
+        )
+    elif sub == "enable":
+        cmd_schedule_enable(store, args.name)
+    elif sub == "disable":
+        cmd_schedule_disable(store, args.name)
+    elif sub == "delete":
+        cmd_schedule_delete(store, args.name, assume_yes=args.yes)
+    elif sub == "run-now":
+        from mailcode.utils.claude_runner import call_claude
+        from mailcode.channels.email_channel import EmailChannel
+        cmd_schedule_run_now(store, args.name,
+            email_channel=EmailChannel(),
+            call_claude_fn=call_claude,
+        )
+    elif sub == "validate":
+        cmd_schedule_validate(store)
+    else:
+        print("用法: mailcode schedule <list|show|add|enable|disable|delete|run-now|validate>", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_config(args):
     import json
     from mailcode.config import load_config, _ensure_user_config, get_config_path
@@ -334,6 +396,60 @@ def build_parser():
     p_session_cleanup.add_argument("--dry-run", action="store_true",
                                    help="只列出将被清理的 session, 不实际删除")
 
+    # ── schedule ──
+    p_schedule = subparsers.add_parser(
+        "schedule",
+        help="定时任务管理 (list/show/add/enable/disable/delete/run-now/validate)",
+        description=(
+            "管理 ~/.config/mailcode/schedules.json 中的定时任务。"
+            "支持 interval / daily / weekly / monthly 四种类型。"
+        ),
+    )
+    p_schedule_sub = p_schedule.add_subparsers(
+        dest="schedule_command", title="schedule 动作", metavar="<动作>"
+    )
+
+    p_schedule_sub.add_parser("list", help="列出全部定时任务")
+
+    p_schedule_sub.add_parser("validate", help="校验 schedules.json 完整性 (不改文件)")
+
+    p_schedule_show = p_schedule_sub.add_parser("show", help="查看单个定时任务详情")
+    p_schedule_show.add_argument("name", help="任务名称")
+
+    p_schedule_add = p_schedule_sub.add_parser("add", help="添加新定时任务")
+    p_schedule_add.add_argument("name", help="任务名称 (唯一)")
+    p_schedule_add.add_argument("--type", choices=["interval", "daily", "weekly", "monthly"],
+                                required=True)
+    p_schedule_add.add_argument("--interval-seconds", type=int,
+                                help="type=interval 时必填")
+    p_schedule_add.add_argument("--time", help="type=daily/weekly/monthly 时必填, HH:MM 格式")
+    p_schedule_add.add_argument("--day-of-week",
+                                choices=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                                help="type=weekly 时必填")
+    p_schedule_add.add_argument("--day-of-month", type=int, choices=range(1, 32),
+                                metavar="[1-31]", help="type=monthly 时必填")
+    p_schedule_add.add_argument("--prompt", required=True, help="Claude prompt 文本")
+    p_schedule_add.add_argument("--to-email", required=True, help="结果邮件的收件人")
+    p_schedule_add.add_argument("--cwd", help="Claude 工作目录 (可选)")
+    p_schedule_add.add_argument("--subject-prefix", help="邮件主题前缀 (可选)")
+
+    p_schedule_enable = p_schedule_sub.add_parser("enable", help="启用一个定时任务")
+    p_schedule_enable.add_argument("name", help="任务名称")
+
+    p_schedule_disable = p_schedule_sub.add_parser("disable", help="禁用一个定时任务")
+    p_schedule_disable.add_argument("name", help="任务名称")
+
+    p_schedule_delete = p_schedule_sub.add_parser("delete", help="删除一个定时任务")
+    p_schedule_delete.add_argument("name", help="任务名称")
+    p_schedule_delete.add_argument("-y", "--yes", action="store_true",
+                                   help="跳过确认")
+
+    p_schedule_run = p_schedule_sub.add_parser(
+        "run-now",
+        help="立即执行一个定时任务 (同步阻塞, 不开 serve 也能跑)",
+    )
+    p_schedule_run.add_argument("name", help="任务名称")
+
     return parser
 
 
@@ -357,6 +473,8 @@ def main():
         cmd_health(args)
     elif args.command == "session":
         cmd_session(args)
+    elif args.command == "schedule":
+        cmd_schedule(args)
 
 if __name__ == "__main__":
     main()
