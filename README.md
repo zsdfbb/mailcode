@@ -98,7 +98,8 @@ SMTP 和 IMAP 配置由系统根据 Bot 邮箱的域名自动识别。支持：Q
 
 | 子命令 | 用途 |
 |--------|------|
-| `mailcode serve` | 启动 IMAP 监听中继 |
+| `mailcode serve` | 启动 IMAP 监听中继（含定时任务调度器）|
+| `mailcode schedule <动作>` | 定时任务管理（`list` / `show` / `add` / `enable` / `disable` / `delete` / `run-now` / `validate`）|
 | `mailcode config <动作>` | 配置管理（`show` / `init` / `init-test` / `path` / `validate`）|
 | `mailcode health` | 邮件连通性检查（SMTP/IMAP）|
 | `mailcode session <动作>` | 会话管理（`list` / `show` / `delete` / `cleanup`）|
@@ -188,3 +189,64 @@ mailcode health    # 检查 SMTP/IMAP 配置与连通性
 ```
 
 检查项：SMTP 连接 / 登录 / 发信、IMAP 连接 / 登录 / 收件箱。
+
+### 定时任务
+
+MailCode 内置轻量定时任务引擎，无需外部 cron 或 systemd timer——直接在 `mailcode serve` 内跑，配置持久化到 `~/.config/mailcode/schedules.json`。
+
+支持四种调度类型：
+
+| 类型 | 参数 | 示例 |
+|------|------|------|
+| `interval` | `--interval-seconds <秒>` | 每 3600 秒运行一次 |
+| `daily` | `--time <HH:MM>` | 每天 09:00 运行 |
+| `weekly` | `--time <HH:MM> --day-of-week <0-6>` | 每周一 09:00（0=周日） |
+| `monthly` | `--time <HH:MM> --day-of-month <1-31>` | 每月 1 号 09:00 |
+
+定时任务会调用 `claude -p <prompt>` 执行指定指令，并将 Claude 的响应邮件发送给指定收件人。所有调度基于本地时间，错过触发窗口的任务自动跳过（不会追赶补跑）。
+
+```bash
+# 创建定时任务
+mailcode schedule add morning-digest --type daily --time 09:00 \
+  --prompt "总结 GitHub 通知, 列出今天待办" \
+  --to-email your@qq.com \
+  --subject-prefix "[晨间摘要]"
+
+# 列出所有任务
+mailcode schedule list
+
+# 查看任务详情
+mailcode schedule show morning-digest
+
+# 立即执行一次（不污染调度统计）
+mailcode schedule run-now morning-digest
+
+# 启用 / 禁用
+mailcode schedule enable morning-digest
+mailcode schedule disable morning-digest
+
+# 删除
+mailcode schedule delete morning-digest
+
+# 校验所有任务配置
+mailcode schedule validate
+```
+
+**配置**（`~/.config/mailcode/config.json`，可选）：
+
+```jsonc
+{
+  "schedule": {
+    "enabled": true,         // 全局开关
+    "tick_seconds": 30       // 调度器轮询间隔
+  }
+}
+```
+
+**特点**：
+
+- **热加载**——通过 CLI 增删改任务后，运行中的 `serve` 进程立即生效，无需重启
+- **并发防护**——同一任务的上次执行未完成时，不会重复触发
+- **错误通知**——Claude 调用或邮件发送失败时，自动通知收件人
+- **独立运行**——`mailcode schedule run-now` 不依赖 `serve` 进程，可单独使用
+- **干跑兼容**——`mailcode serve --dry-run` 下标记执行结果但不真实调用

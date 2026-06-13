@@ -290,7 +290,7 @@ def build_parser():
             "工作流: 发件人给机器人邮箱发邮件 → MailCode 在 IMAP 拉取 → 注入到本地 Agent\n"
             "       → Agent 回复内容回写到同一主题 → MailCode 通过 SMTP 把回复转发给发件人。\n"
             "\n"
-            "本 CLI 主要用于: 配置管理、连通性检查、启动中继、以及维护 Agent 对话 session。"
+            "本 CLI 主要用于: 配置管理、连通性检查、启动中继（含定时任务调度器）、维护 Agent 对话 session。"
         ),
         epilog=(
             "典型使用流程:\n"
@@ -298,8 +298,9 @@ def build_parser():
             "  2) 编辑授权码 mailcode config path && $EDITOR .../config.json\n"
             "  3) 校验配置   mailcode config validate\n"
             "  4) 自检连通性 mailcode health\n"
-            "  5) 启动中继   mailcode serve                  # 长期后台运行 (默认 IDLE 长连接)\n"
+            "  5) 启动中继   mailcode serve                  # 长期后台运行 (默认 IDLE 长连接, 含定时任务调度器)\n"
             "  6) 维护会话   mailcode session list|show|delete|cleanup\n"
+            "  7) 定时任务   mailcode schedule add/list|enable|disable|run-now\n"
             "\n"
             "调试提示:\n"
             "  • 想看收到什么邮件但不想执行: mailcode serve --once --dry-run\n"
@@ -316,9 +317,10 @@ def build_parser():
     # ── serve ──
     p_serve = subparsers.add_parser(
         "serve",
-        help="启动 IMAP 监听中继 (前台常驻)",
+        help="启动 IMAP 监听中继 (前台常驻, 含定时任务调度器)",
         description=(
             "启动 IMAP 监听中继: 拉取 bot 邮箱里的未读邮件, 注入本地 AI Agent, 把回复通过 SMTP 转发回发件人。\n"
+            "同时运行定时任务调度器: 按 schedules.json 中的配置在后台周期性执行 claude -p 并邮件通知结果。\n"
             "默认使用 IMAP IDLE 长连接 (实时推送, 适用于 QQ / Gmail / Outlook)。\n"
             "126/163 邮箱不支持 IDLE, 自动回退到轮询, 需将 check_interval 调到 60-120 秒避免反滥用。\n"
             "Ctrl-C 退出, 日志写入 ~/.config/mailcode/relay.log。"
@@ -327,7 +329,7 @@ def build_parser():
     p_serve.add_argument("--dry-run", action="store_true",
                         help="干跑模式: 只打印邮件内容, 不注入 Agent, 不发送回复（用于排查邮件解析）")
     p_serve.add_argument("--once", action="store_true",
-                        help="处理完一轮未读后退出 (用于脚本/调试, 默认持续监听)")
+                        help="处理完一轮未读后退出 (调度器不启动, 用于脚本/调试, 默认持续监听)")
     p_serve.add_argument("--no-idle", action="store_true",
                         help="禁用 IMAP IDLE 长连接, 改用固定间隔轮询 (默认启用 IDLE)")
     p_serve.add_argument("--session", "-S", action="store_true",
@@ -399,19 +401,21 @@ def build_parser():
     # ── schedule ──
     p_schedule = subparsers.add_parser(
         "schedule",
-        help="定时任务管理 (list/show/add/enable/disable/delete/run-now/validate)",
+        help="定时任务管理 (list|show|add|enable|disable|delete|run-now|validate)",
         description=(
-            "管理 ~/.config/mailcode/schedules.json 中的定时任务。"
-            "支持 interval / daily / weekly / monthly 四种类型。"
+            "管理 ~/.config/mailcode/schedules.json 中的定时任务 (无需外部 cron)。\n"
+            "支持 interval（固定间隔）/ daily（每天定点）/ weekly（每周某天）/ monthly（每月某天）四种类型。\n"
+            "运行 mailcode serve 时调度器自动在后台运行, 到期触发 claude -p <prompt> 并邮件通知。\n"
+            "missed_run 自动跳过不追赶; 任务配置热加载, 增删改立即生效无需重启 serve。"
         ),
     )
     p_schedule_sub = p_schedule.add_subparsers(
         dest="schedule_command", title="schedule 动作", metavar="<动作>"
     )
 
-    p_schedule_sub.add_parser("list", help="列出全部定时任务")
+    p_schedule_sub.add_parser("list", help="列出全部定时任务 (名称/类型/调度/状态/下次运行时间)")
 
-    p_schedule_sub.add_parser("validate", help="校验 schedules.json 完整性 (不改文件)")
+    p_schedule_sub.add_parser("validate", help="校验 schedules.json 完整性 (名称唯一/调度合法/邮箱有效/prompt 非空, 只读不改)")
 
     p_schedule_show = p_schedule_sub.add_parser("show", help="查看单个定时任务详情")
     p_schedule_show.add_argument("name", help="任务名称")
@@ -446,7 +450,7 @@ def build_parser():
 
     p_schedule_run = p_schedule_sub.add_parser(
         "run-now",
-        help="立即执行一个定时任务 (同步阻塞, 不开 serve 也能跑)",
+        help="立即同步执行指定任务 (不依赖 serve, 不污染 last_run_at / next_run_at)",
     )
     p_schedule_run.add_argument("name", help="任务名称")
 
