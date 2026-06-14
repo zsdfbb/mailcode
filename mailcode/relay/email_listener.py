@@ -363,7 +363,7 @@ class IMAPListener:
 
             for uid_bytes in uids:
                 uid = uid_bytes.decode()
-                status, msg_data = mail.fetch(uid_bytes, "(RFC822)")
+                status, msg_data = mail.fetch(uid_bytes, "(BODY.PEEK[])")
                 if status != "OK":
                     continue
 
@@ -609,6 +609,8 @@ class IMAPListener:
 
         iteration = 0
         backoff = _Backoff()
+        HEALTH_CHECK_INTERVAL = 60  # 秒: IDLE 健康检查周期
+        health_check_every = max(1, HEALTH_CHECK_INTERVAL // self._idle_timeout)
 
         try:
             while not self._stopped.is_set():
@@ -630,12 +632,28 @@ class IMAPListener:
                             break
                         mail = self._reconnect()
                         mail.select("INBOX")
+                        logger.info("IDLE 收到事件, 已重连")
 
                     if self._stopped.is_set():
                         break
 
+                    # 健康检查: 每 60s 一次 NOOP 探测死连接
+                    # 必须在 got_event 分支之后 (mail 是重连后的新连接),
+                    # 避免与 _wait_for_idle_old 后台 IDLE daemon 线程撞协议
+                    if iteration % health_check_every == 0:
+                        logger.debug(f"IDLE 健康检查 iter={iteration}")
+                        try:
+                            mail.noop()
+                        except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
+                            logger.warning(f"IDLE 健康检查失败 ({type(e).__name__}), 触发重连")
+                            raise
+
                     # 复用现有连接, 避免每轮 fetch 再开一个 (163 反滥用触发点)
                     emails = self.fetch_unread_emails(dry_run=dry_run, mail=mail)
+
+                    # 重连后首轮 fetch 若拉到累积未读, 显式记录
+                    if iteration <= health_check_every + 1 and emails:
+                        logger.info(f"重连后首轮 fetch 拉到 {len(emails)} 封累积未读")
 
                     for email_entry in emails:
                         if dry_run:
@@ -663,6 +681,7 @@ class IMAPListener:
                     try:
                         mail = self._reconnect()
                         mail.select("INBOX")
+                        logger.info("退避重连成功, 准备拉取累积未读")
                     except imaplib.IMAP4.error as auth_err:
                         # 重连时再认证失败 = 配置问题, 放弃
                         logger.error(f"IMAP 认证失败, 放弃重试: {auth_err}")

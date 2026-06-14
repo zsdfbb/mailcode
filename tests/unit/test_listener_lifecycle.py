@@ -163,6 +163,158 @@ class TestListenerLifecycle:
         # 循环退出后, _active_idle_mail 必须被清空
         assert listener._active_idle_mail is None
 
+    def test_idle_health_check_triggers_reconnect_on_noop_abort(self, mock_config_patch, caplog):
+        """R1: 60s NOOP 健康检查抛 IMAP4.abort 时, 应触发退避重连路径"""
+        import logging
+        from imaplib import IMAP4
+        caplog.set_level(logging.DEBUG)
+
+        listener = IMAPListener()
+
+        # 主连接: 有 IDLE 能力, mock noop()
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        # noop: iter 12 触发 NOOP 时抛 abort; 后续成功
+        noop_call_count = [0]
+        def fake_noop():
+            noop_call_count[0] += 1
+            if noop_call_count[0] == 1:
+                raise IMAP4.abort("socket closed by server")
+            return ("OK", [None])
+        mock_mail.noop.side_effect = fake_noop
+
+        # 让循环跑到 iter 12 (NOOP 触发) → abort → 重连 → 第二轮后停止
+        iter_count = [0]
+        def stop_after_noop_reconnect(*args, **kw):
+            iter_count[0] += 1
+            if iter_count[0] >= 13:  # iter 12 NOOP abort, iter 13 退出
+                listener._stopped.set()
+            return False  # 不收事件, 让 NOOP 触发
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", side_effect=stop_after_noop_reconnect), \
+             patch.object(listener, "_reconnect", return_value=mock_mail) as mock_reconnect, \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        # 验证: NOOP 失败触发了重连
+        assert mock_reconnect.called
+        # 验证: warning 日志出现
+        assert any("IDLE 健康检查失败" in msg for msg in caplog.messages), \
+            f"Expected NOOP failure log. caplog: {caplog.messages}"
+
+    def test_fetch_unread_uses_body_peek_not_rfc822(self, mock_config_patch):
+        """R3: fetch_unread_emails 用 BODY.PEEK[] 而非 RFC822, 避免打 \\Seen 标志"""
+        listener = IMAPListener()
+
+        mock_mail = MagicMock()
+        mock_mail.select.return_value = ("OK", [b"1"])
+        mock_mail.search.return_value = ("OK", [b"100"])
+        # 最小合法邮件
+        raw = b"From: u@t.com\r\nSubject: test\r\n\r\nhello"
+        mock_mail.fetch.return_value = ("OK", [(b"100 (BODY.PEEK[] {5}", raw)])
+
+        with patch.object(listener, "_is_own_message", return_value=False), \
+             patch.object(listener, "_is_duplicate", return_value=False), \
+             patch("mailcode.relay.email_listener.get_auth_policy", return_value="off"), \
+             patch.object(listener.security_checker, "is_sender_allowed", return_value=True):
+            results = listener.fetch_unread_emails(dry_run=True, mail=mock_mail)
+        assert isinstance(results, list)  # consume unused var
+
+        # 至少一次 fetch 调用
+        assert len(mock_mail.fetch.call_args_list) >= 1
+        for call in mock_mail.fetch.call_args_list:
+            args = call.args if hasattr(call, "args") else call[0]
+            assert "BODY.PEEK" in args[1], f"Expected BODY.PEEK, got {args[1]}"
+            assert "RFC822" not in args[1], f"RFC822 should not be present, got {args[1]}"
+
+    def test_post_reconnect_fetch_logs_accumulated_count(self, mock_config_patch, caplog):
+        """R2: got_event=True 触发重连后, 首轮 fetch 拉到 N 封累积未读, 日志显式记录"""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        # 第一次 fetch 返回 3 封累积未读, 之后空
+        fetch_results = [
+            [{"uid": "1", "body": ""}, {"uid": "2", "body": ""}, {"uid": "3", "body": ""}],
+            [],
+        ]
+        fetch_calls = [0]
+        def fake_fetch(*args, **kwargs):
+            idx = min(fetch_calls[0], len(fetch_results) - 1)
+            r = fetch_results[idx]
+            fetch_calls[0] += 1
+            return r
+
+        # 第一轮: got_event=True → 重连 → fetch 返回 3 封
+        # 第二轮: fetch 返回空, 停止
+        idle_calls = [0]
+        def fake_wait_for_idle(mail):
+            idle_calls[0] += 1
+            if idle_calls[0] >= 2:
+                listener._stopped.set()
+            return True  # got_event 走重连分支
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", side_effect=fake_wait_for_idle), \
+             patch.object(listener, "_reconnect", return_value=mock_mail), \
+             patch.object(listener, "fetch_unread_emails", side_effect=fake_fetch), \
+             patch.object(listener, "process_email", return_value=(True, "ok")):
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        assert any("重连后首轮 fetch 拉到 3 封累积未读" in msg for msg in caplog.messages), \
+            f"Expected log not found. caplog: {caplog.messages}"
+
+    def test_backoff_reconnect_success_log(self, mock_config_patch, caplog):
+        """R4: 外层 except 退避后 _reconnect 成功, 打 '退避重连成功' 日志"""
+        import logging
+        from imaplib import IMAP4
+        caplog.set_level(logging.INFO)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        noop_call_count = [0]
+        def fake_noop():
+            noop_call_count[0] += 1
+            if noop_call_count[0] == 1:
+                raise IMAP4.abort("socket closed")
+            return ("OK", [None])
+        mock_mail.noop.side_effect = fake_noop
+
+        iter_count = [0]
+        def fake_wait_for_idle(mail):
+            iter_count[0] += 1
+            if iter_count[0] >= 13:  # 让 iter 12 触发 NOOP
+                listener._stopped.set()
+            return False
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", side_effect=fake_wait_for_idle), \
+             patch.object(listener, "_reconnect", return_value=mock_mail) as mock_reconnect, \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        assert mock_reconnect.called
+        assert any("退避重连成功, 准备拉取累积未读" in msg for msg in caplog.messages), \
+            f"Expected log not found. caplog: {caplog.messages}"
+
 
 # ============================================================
 # process_email 路由表
