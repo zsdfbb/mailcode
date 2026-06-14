@@ -543,6 +543,33 @@ class TestListenerLifecycle:
         assert mock_prune.call_count >= 1, \
             f"Expected prune call in finally, got {mock_prune.call_count}"
 
+    # ============================================================
+    # 诊断: 假 IDLE 通知 → fetch 空 → 静默无日志
+    # ============================================================
+
+    def test_idle_event_no_new_email_logs_info(self, mock_config_patch, caplog):
+        """got_event=True 但 fetch 返回空时, 应打日志说明原因"""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", return_value=True), \
+             patch.object(listener, "_reconnect", return_value=mock_mail), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=1)
+
+        # 预期: 有日志说明 IDLE 事件后没有新邮件 (非新邮件的假通知)
+        assert any("IDLE 事件后无新邮件" in msg for msg in caplog.messages), \
+            f"Expected log about no new emails after IDLE event. caplog: {caplog.messages}"
+
 
 # ============================================================
 # process_email 路由表

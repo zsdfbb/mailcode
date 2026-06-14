@@ -386,6 +386,7 @@ class IMAPListener:
 
             uids = messages[0].split()
             if not uids:
+                logger.info("SEARCH UNSEEN 无结果 (可能收到非新邮件的 IMAP 通知)")
                 return results
 
             for uid_bytes in uids:
@@ -404,9 +405,11 @@ class IMAPListener:
                 in_reply_to = msg.get("In-Reply-To", "")
 
                 if self._is_own_message(msg):
+                    logger.debug(f"跳过自身邮件: {subject}")
                     continue
 
                 if self._is_duplicate(msg_id, uid):
+                    logger.debug(f"跳过重复邮件: UID={uid} MsgID={msg_id}")
                     continue
 
                 sender_email = parseaddr(from_header)[1].lower() or from_header.lower()
@@ -421,6 +424,7 @@ class IMAPListener:
                     logger.info(f"邮件认证状态 [{sender_email}]: {auth_reason}")
 
                 if not self.security_checker.is_sender_allowed(sender_email):
+                    logger.info(f"发件人不在白名单中 [{sender_email}], 已跳过")
                     continue
 
                 body = self._extract_body(msg)
@@ -716,6 +720,10 @@ class IMAPListener:
                     # 重连后首轮 fetch 若拉到累积未读, 显式记录
                     if iteration <= health_check_every + 1 and emails:
                         logger.info(f"重连后首轮 fetch 拉到 {len(emails)} 封累积未读")
+
+                    # got_event 但无结果: 可能是非新邮件的 IMAP 通知 (flag 变更/BYE/keepalive)
+                    if got_event and not emails:
+                        logger.info("IDLE 事件后无新邮件 (可能为非新邮件的 IMAP 通知)")
 
                     for email_entry in emails:
                         if dry_run:
