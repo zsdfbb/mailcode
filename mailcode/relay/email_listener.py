@@ -6,6 +6,7 @@ import json
 import random
 import re
 import socket
+import time
 import threading
 import logging
 from datetime import datetime, timedelta
@@ -82,6 +83,10 @@ class IMAPListener:
         self._mail: Optional[imaplib.IMAP4_SSL] = None
         self._active_idle_mail: Optional[imaplib.IMAP4_SSL] = None
         self._stopped = threading.Event()
+
+        # 预判性重连: QQ 邮箱约 2h 静默断连, 提前至 90min 主动重建连接
+        self.FORCED_RECONNECT_INTERVAL = 5400  # 秒, 可被测试覆盖改写
+        self._last_connect_time = time.monotonic()
 
     def stop(self):
         """向监听循环发出干净退出信号。从信号处理程序调用。
@@ -228,7 +233,22 @@ class IMAPListener:
         except Exception:
             pass
 
-        return not self._idle_ready.is_set()
+        got_event = not self._idle_ready.is_set()
+
+        # 超时后必须退出 idle_thread, 否则主线程后续的 NOOP/SELECT 会与
+        # idle_thread 中阻塞的 mail.idle_response() 撞协议, 导致 socket error.
+        if not got_event:
+            self._idle_ready.clear()
+            try:
+                mail.idle_done()
+            except Exception:
+                pass
+            _t = self._idle_thread
+            self._idle_thread = None
+            if _t and _t.is_alive():
+                _t.join(timeout=3)
+
+        return got_event
 
     def _wait_for_idle_new(self, mail: imaplib.IMAP4_SSL) -> bool:
         """Py3.13+ IDLE 路径: 同步 `with mail.idle(duration=...)` 等待.
@@ -352,6 +372,11 @@ class IMAPListener:
             if owns_connection:
                 mail = self._connect()
             mail.select("INBOX")
+            # NOOP 刷新任何残留的挂起响应, 避免后续 SEARCH 读到错误响应
+            try:
+                mail.noop()
+            except Exception:
+                pass
 
             status, messages = mail.search(None, "UNSEEN")
             if status != "OK":
@@ -632,6 +657,11 @@ class IMAPListener:
                             break
                         mail = self._reconnect()
                         mail.select("INBOX")
+                        try:
+                            mail.noop()
+                        except Exception:
+                            pass
+                        self._last_connect_time = time.monotonic()
                         logger.info("IDLE 收到事件, 已重连")
 
                     if self._stopped.is_set():
@@ -647,6 +677,17 @@ class IMAPListener:
                         except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
                             logger.warning(f"IDLE 健康检查失败 ({type(e).__name__}), 触发重连")
                             raise
+
+                    # 预判性重连: QQ 邮箱约 2h 静默断连, 提前至 FORCED_RECONNECT_INTERVAL 秒主动重建
+                    if not got_event and time.monotonic() - self._last_connect_time >= self.FORCED_RECONNECT_INTERVAL:
+                        logger.info("预判性重连: 连接已持续 %d 秒", self.FORCED_RECONNECT_INTERVAL)
+                        mail = self._reconnect()
+                        mail.select("INBOX")
+                        try:
+                            mail.noop()
+                        except Exception:
+                            pass
+                        self._last_connect_time = time.monotonic()
 
                     # 复用现有连接, 避免每轮 fetch 再开一个 (163 反滥用触发点)
                     emails = self.fetch_unread_emails(dry_run=dry_run, mail=mail)
@@ -681,6 +722,11 @@ class IMAPListener:
                     try:
                         mail = self._reconnect()
                         mail.select("INBOX")
+                        try:
+                            mail.noop()
+                        except Exception:
+                            pass
+                        self._last_connect_time = time.monotonic()
                         logger.info("退避重连成功, 准备拉取累积未读")
                     except imaplib.IMAP4.error as auth_err:
                         # 重连时再认证失败 = 配置问题, 放弃

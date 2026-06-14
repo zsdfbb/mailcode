@@ -315,6 +315,120 @@ class TestListenerLifecycle:
         assert any("退避重连成功, 准备拉取累积未读" in msg for msg in caplog.messages), \
             f"Expected log not found. caplog: {caplog.messages}"
 
+    def test_wait_for_idle_old_cleans_up_on_timeout(self, mock_config_patch):
+        """Fix 2: _wait_for_idle_old 超时后正确清理 idle_thread。"""
+        import threading
+
+        listener = IMAPListener()
+        listener._idle_timeout = 0.1  # 100ms 超时, 足够让 idle_thread 进入 idle_response
+
+        mail = MagicMock(spec=["idle", "idle_response", "idle_done", "select", "logout", "capabilities"])
+
+        # idle_response 阻塞直到 idle_done 解除
+        response_unblock = threading.Event()
+        mail.idle_response.side_effect = lambda: (
+            response_unblock.wait(timeout=10) or ("OK", [None])
+        )
+        mail.idle_done.side_effect = lambda: response_unblock.set()
+
+        result = listener._wait_for_idle_old(mail)
+
+        assert result is False, "应返回 False (超时)"
+        mail.idle_done.assert_called_once()
+        assert not listener._idle_ready.is_set(), "_idle_ready 应被清除"
+        if listener._idle_thread:
+            listener._idle_thread.join(timeout=2)
+            assert not listener._idle_thread.is_alive(), "idle_thread 应已退出"
+
+    def test_forced_reconnect_triggers_after_interval(self, mock_config_patch, caplog):
+        """Fix 3: 超过 90min 后触发预判性重连。"""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        listener = IMAPListener()
+        listener.FORCED_RECONNECT_INTERVAL = 0  # 立即触发
+        listener._last_connect_time = 0
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", return_value=False), \
+             patch.object(listener, "_reconnect", return_value=mock_mail) as mock_reconnect, \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=1)
+
+        assert mock_reconnect.called, "预判重连应被触发"
+        assert any("预判性重连" in msg for msg in caplog.messages), \
+            f"Expected proactive reconnect log. caplog: {caplog.messages}"
+
+    def test_forced_reconnect_skipped_when_got_event(self, mock_config_patch):
+        """Fix 3: got_event=True 时预判重连不额外触发。"""
+        listener = IMAPListener()
+        listener.FORCED_RECONNECT_INTERVAL = 0  # 区间为 0 也应跳过
+        listener._last_connect_time = 0
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        reconnect_calls = [0]
+        def fake_reconnect():
+            reconnect_calls[0] += 1
+            return mock_mail
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", return_value=True), \
+             patch.object(listener, "_reconnect", side_effect=fake_reconnect), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=2)
+
+        # 2 次 got_event=True → 2 次 _reconnect (不带预判额外)
+        assert reconnect_calls[0] == 2
+
+    def test_noop_after_select_in_fetch(self, mock_config_patch):
+        """Fix 4: fetch_unread_emails 在 SELECT 后立即 NOOP。"""
+        listener = IMAPListener()
+
+        mock_mail = MagicMock()
+        mock_mail.select.return_value = ("OK", [b"1"])
+        mock_mail.search.return_value = ("OK", [b""])
+
+        results = listener.fetch_unread_emails(mail=mock_mail)
+
+        assert isinstance(results, list)
+        call_names = [c[0] for c in mock_mail.method_calls]
+        select_idx = next(i for i, n in enumerate(call_names) if n == "select")
+        noop_idx = next(i for i, n in enumerate(call_names) if n == "noop")
+        search_idx = next(i for i, n in enumerate(call_names) if n == "search")
+        assert select_idx < noop_idx, "NOOP 应在 SELECT 之后"
+        assert noop_idx < search_idx, "NOOP 应在 SEARCH 之前"
+
+    def test_noop_after_reconnect_select(self, mock_config_patch):
+        """Fix 4: _listen_idle 的 got_event 重连后执行 NOOP。"""
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", return_value=True), \
+             patch.object(listener, "_reconnect", return_value=mock_mail), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=1)
+
+        call_names = [c[0] for c in mock_mail.method_calls]
+        noop_calls = [i for i, n in enumerate(call_names) if n == "noop"]
+        assert len(noop_calls) >= 1, "NOOP 应至少被调一次"
+
 
 # ============================================================
 # process_email 路由表

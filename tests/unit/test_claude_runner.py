@@ -23,7 +23,7 @@ class TestCallClaude:
     """claude -p 子进程调用测试。"""
 
     def test_success(self):
-        """成功调用返回 stdout.strip()。"""
+        """成功调用返回 stdout.strip(), 使用 stdin 而非 -p。"""
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = "  Hello, world!  \n"
@@ -35,15 +35,12 @@ class TestCallClaude:
         assert result == "Hello, world!"
         mock_run.assert_called_once()
         args, kwargs = mock_run.call_args
-        assert args[0] == [
-            "claude",
-            "-p",
-            "test prompt",
-            "--dangerously-skip-permissions",
-        ]
+        # 应通过 stdin 传 prompt, 不再用 -p
+        assert "-p" not in args[0], f"-p flag should not be in args: {args[0]}"
+        assert kwargs["input"] == "test prompt"
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
-        assert kwargs["timeout"] == 300
+        assert kwargs["timeout"] == 86400
         # 默认 cwd 应该是 Path.home()
         assert kwargs["cwd"] == str(Path.home())
 
@@ -102,6 +99,38 @@ class TestCallClaude:
 
         _, kwargs = mock_run.call_args
         assert kwargs["cwd"] == "/tmp"
+
+    def test_stdin_instead_of_dash_p(self):
+        """prompt 通过 stdin (input=) 传入, 不经过 -p 参数。"""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+
+        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
+            cr_module.call_claude("hello")
+
+        args = mock_run.call_args[0][0]
+        assert "-p" not in args
+        kwargs = mock_run.call_args[1]
+        assert kwargs["input"] == "hello"
+
+    def test_multiline_prompt_with_yaml_frontmatter(self):
+        """含 --- YAML frontmatter 的多行 prompt 不应报 unknown option。"""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "response"
+        mock_result.stderr = ""
+
+        prompt = "---\ntitle: 投资基础系列-定时任务\n---\n\n# 正文"
+        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
+            result = cr_module.call_claude(prompt)
+
+        assert result == "response"
+        args = mock_run.call_args[0][0]
+        assert "-p" not in args
+        kwargs = mock_run.call_args[1]
+        assert kwargs["input"] == prompt
 
     def test_module_level_signature(self):
         """call_claude 是模块级函数, 可独立导入, 不依赖 handler 实例。"""
