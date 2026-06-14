@@ -429,6 +429,120 @@ class TestListenerLifecycle:
         noop_calls = [i for i, n in enumerate(call_names) if n == "noop"]
         assert len(noop_calls) >= 1, "NOOP 应至少被调一次"
 
+    # ============================================================
+    # Review 后续修复: poll 退避 / 原子写 / prune 调用
+    # ============================================================
+
+    def test_listen_poll_backoff_on_connection_error(self, mock_config_patch, caplog):
+        """_listen_poll: ConnectionError 触发退避重连, 不崩溃继续轮询"""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        listener = IMAPListener()
+        call_count = [0]
+
+        def fake_fetch(**kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise ConnectionError("connection lost")
+            return []
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "fetch_unread_emails", side_effect=fake_fetch):
+            listener._listen_poll(dry_run=False, max_iterations=2)
+
+        assert call_count[0] == 2, "第二轮 fetch 应成功"
+        assert any("连接失败" in msg for msg in caplog.messages), \
+            f"Expected connection error log. caplog: {caplog.messages}"
+
+    def test_listen_poll_fatal_on_imap_error(self, mock_config_patch, caplog):
+        """_listen_poll: IMAP4.error 导致循环退出 (不是退避重连)"""
+        import logging
+        from imaplib import IMAP4
+        caplog.set_level(logging.ERROR)
+
+        listener = IMAPListener()
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "fetch_unread_emails",
+                          side_effect=IMAP4.error("SELECT failed")):
+            listener._listen_poll(dry_run=False, max_iterations=100)
+
+        assert any("IMAP 协议错误" in msg for msg in caplog.messages), \
+            f"Expected IMAP error log. caplog: {caplog.messages}"
+
+    def test_listen_poll_backoff_on_eof_error(self, mock_config_patch, caplog):
+        """_listen_poll: EOFError 也触发退避"""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        listener = IMAPListener()
+        call_count = [0]
+
+        def fake_fetch(**kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise EOFError("connection closed by server")
+            return []
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "fetch_unread_emails", side_effect=fake_fetch):
+            listener._listen_poll(dry_run=False, max_iterations=2)
+
+        assert call_count[0] == 2
+        assert any("连接失败" in msg for msg in caplog.messages)
+
+    def test_save_state_atomic_write(self, mock_config_patch, tmp_path):
+        """_save_state 使用 tmp+replace 原子写, 写完后 .tmp 文件不存在"""
+        listener = IMAPListener()
+        listener.state_path = tmp_path / "state.json"
+        listener.state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {"processed_uids": ["1", "2"], "sent_messages": []}
+        listener._save_state(state)
+
+        # 验证: state.json 存在
+        assert listener.state_path.exists(), "state.json 应存在"
+        # 验证: .tmp 已被 replace 清理
+        tmp = listener.state_path.with_suffix(".tmp")
+        assert not tmp.exists(), f"中间 .tmp 文件应已清理: {tmp}"
+
+        import json
+        with open(listener.state_path) as f:
+            assert json.load(f) == state
+
+    def test_prune_called_before_save_in_poll(self, mock_config_patch):
+        """_listen_poll: 开头和每轮迭代都调用 _prune_old_sent_messages"""
+        listener = IMAPListener()
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]), \
+             patch.object(listener, "_prune_old_sent_messages") as mock_prune:
+            listener._listen_poll(dry_run=False, max_iterations=1)
+
+        # 开局 1 次 + 迭代 1 次 = 2 次
+        assert mock_prune.call_count == 2, \
+            f"Expected 2 prune calls, got {mock_prune.call_count}"
+
+    def test_prune_called_before_save_in_listen_finally(self, mock_config_patch):
+        """listen(): finally 块的 _save_state 前调用 _prune_old_sent_messages"""
+        listener = IMAPListener()
+
+        with patch.object(listener, "_listen_poll", wraps=lambda *a, **kw: (
+            listener._stopped.set()
+        )), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_prune_old_sent_messages") as mock_prune:
+            listener.listen(dry_run=False, use_idle=False)
+
+        # finally 块中应调 1 次 prune
+        assert mock_prune.call_count >= 1, \
+            f"Expected prune call in finally, got {mock_prune.call_count}"
+
 
 # ============================================================
 # process_email 路由表

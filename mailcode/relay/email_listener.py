@@ -125,8 +125,10 @@ class IMAPListener:
 
     def _save_state(self, state: dict):
         """原子写 state 到 state.json。state 应包含 processed_uids + sent_messages。"""
-        with open(self.state_path, "w", encoding="utf-8") as f:
+        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+        tmp_path.replace(self.state_path)
 
     def _prune_old_sent_messages(self):
         """清理 7 天前的 sent_messages, 限制 processed_uids 上限。"""
@@ -564,6 +566,7 @@ class IMAPListener:
         finally:
             print("监听器已停止")
             if not dry_run:
+                self._prune_old_sent_messages()
                 self._save_state({
                     "processed_uids": list(self.processed_uids),
                     "sent_messages": self.sent_messages,
@@ -573,31 +576,48 @@ class IMAPListener:
         if not self.security_checker.config.get("allowed_senders"):
             logger.warning("发件人白名单为空，所有邮件将被拒绝处理。请在配置文件中设置 allowed_senders")
         self._init_baseline()
+        self._prune_old_sent_messages()
         self._save_state({
             "processed_uids": list(self.processed_uids),
             "sent_messages": self.sent_messages,
         })
         iteration = 0
+        backoff = _Backoff()
         while not self._stopped.is_set():
             iteration += 1
             if max_iterations and iteration > max_iterations:
                 break
 
-            emails = self.fetch_unread_emails(dry_run=dry_run)
+            try:
+                emails = self.fetch_unread_emails(dry_run=dry_run)
 
-            for email_entry in emails:
-                if dry_run:
-                    continue
+                for email_entry in emails:
+                    if dry_run:
+                        continue
 
-                success, message = self.process_email(email_entry, dry_run=dry_run)
-                status_icon = "OK" if success else "FAIL"
-                logger.info(f"{status_icon} {message}")
+                    success, message = self.process_email(email_entry, dry_run=dry_run)
+                    status_icon = "OK" if success else "FAIL"
+                    logger.info(f"{status_icon} {message}")
 
-            if not dry_run:
-                self._save_state({
-                    "processed_uids": list(self.processed_uids),
-                    "sent_messages": self.sent_messages,
-                })
+                self._prune_old_sent_messages()
+                if not dry_run:
+                    self._save_state({
+                        "processed_uids": list(self.processed_uids),
+                        "sent_messages": self.sent_messages,
+                    })
+
+                backoff.reset()
+
+            except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
+                delay = backoff.next_delay()
+                self._log_connection_error(e, attempt=backoff._n, next_delay=delay)
+                if self._stopped.wait(timeout=delay):
+                    break
+                continue
+            except imaplib.IMAP4.error as e:
+                host = self.imap_config.get("host", "?")
+                logger.error(f"IMAP 协议错误, 放弃轮询 [{host}]: {e}")
+                break
 
             if self._stopped.wait(timeout=self.check_interval):
                 break
@@ -606,6 +626,7 @@ class IMAPListener:
         if not self.security_checker.config.get("allowed_senders"):
             logger.warning("发件人白名单为空，所有邮件将被拒绝处理。请在配置文件中设置 allowed_senders")
         self._init_baseline()
+        self._prune_old_sent_messages()
         self._save_state({
             "processed_uids": list(self.processed_uids),
             "sent_messages": self.sent_messages,
@@ -705,6 +726,7 @@ class IMAPListener:
                         logger.info(f"{status_icon} {message}")
 
                     if not dry_run:
+                        self._prune_old_sent_messages()
                         self._save_state({
                             "processed_uids": list(self.processed_uids),
                             "sent_messages": self.sent_messages,

@@ -60,7 +60,7 @@ class TestCallClaude:
         """TimeoutExpired 时返回 None。"""
         with patch.object(
             subprocess, "run",
-            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=300),
+            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=86400),
         ):
             result = cr_module.call_claude("test")
 
