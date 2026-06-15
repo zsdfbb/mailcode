@@ -686,7 +686,6 @@ class IMAPListener:
                             mail.noop()
                         except Exception:
                             pass
-                        self._last_connect_time = time.monotonic()
                         logger.info("IDLE 收到事件, 已重连")
 
                     if self._stopped.is_set():
