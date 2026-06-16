@@ -153,6 +153,16 @@ fi
 export PATH="${INSTALL_DIR}:${PATH}"
 hash -r 2>/dev/null || true
 
+# ── 3.5 检查 Claude Code ──
+if command -v claude &>/dev/null; then
+    log "Claude Code 已安装: $(claude --version 2>/dev/null || echo '版本未知')"
+else
+    warn "未检测到 Claude Code"
+    echo "  MailCode 需要 Claude Code 来处理邮件命令。请访问以下地址安装:"
+    echo "  https://docs.anthropic.com/en/docs/claude-code/overview"
+    echo ""
+fi
+
 # ── 4. 初始化/升级配置 ──
 mailcode config init
 log "配置已就绪"

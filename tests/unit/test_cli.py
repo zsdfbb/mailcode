@@ -422,20 +422,27 @@ class TestSession:
         """session cleanup 调用 handler._cleanup_expired_sessions"""
         from mailcode.cli import cmd_session
 
-        with patch("mailcode.cli._build_session_handler") as mock_builder:
+        with patch("mailcode.cli._build_session_handler") as mock_builder, \
+             patch("mailcode.config.get_session_config") as mock_config:
             mock_handler = MagicMock()
             mock_handler._cleanup_expired_sessions.return_value = 3
+            mock_handler.list_sessions.return_value = [
+                {"session_id": "abc123", "last_interaction": 100, "email_count": 2},
+                {"session_id": "def456", "last_interaction": 200, "email_count": 5},
+            ]
             mock_builder.return_value = mock_handler
+            mock_config.return_value = {"session_ttl_days": 90}
 
             class FakeArgs:
                 session_command = "cleanup"
                 dry_run = True
 
             cmd_session(FakeArgs())
-            mock_handler._cleanup_expired_sessions.assert_called_once_with(dry_run=True)
             out = capsys.readouterr().out
-            assert "3" in out
             assert "dry-run" in out
+            assert "abc123" in out
+            assert "def456" in out
+            assert "(实际未删除)" in out
 
 
 # ============================================================

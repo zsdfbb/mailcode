@@ -30,6 +30,7 @@ def cmd_serve(args):
         print("❌ MailCode 中继启动失败:")
         for e in errors:
             print(f"  - {e}")
+        print("💡 建议: 运行 mailcode health 检查连通性")
         sys.exit(1)
 
     from mailcode.utils.logging import setup_logging
@@ -43,10 +44,10 @@ def cmd_serve(args):
 
 
 def cmd_session(args):
-    """session 子命令: list / show / delete / cleanup。"""
+    """session 子命令: list / show / delete / cleanup / stats。"""
     sub = getattr(args, "session_command", None)
     if sub is None:
-        print("用法: mailcode session <list|show|delete|cleanup>", file=sys.stderr)
+        print("用法: mailcode session <list|show|delete|cleanup|stats>", file=sys.stderr)
         sys.exit(1)
 
     handler = _build_session_handler()
@@ -54,18 +55,23 @@ def cmd_session(args):
     from mailcode.session_cli import (
         cmd_session_list, cmd_session_show,
         cmd_session_delete, cmd_session_cleanup,
+        cmd_session_stats,
     )
 
     if sub == "list":
-        cmd_session_list(handler)
+        cmd_session_list(handler,
+            wide=getattr(args, "wide", False),
+            filter_text=getattr(args, "filter", "") or "")
     elif sub == "show":
         cmd_session_show(handler, args.session_id)
     elif sub == "delete":
         cmd_session_delete(handler, args.session_id, assume_yes=getattr(args, "yes", False))
     elif sub == "cleanup":
         cmd_session_cleanup(handler, dry_run=getattr(args, "dry_run", False))
+    elif sub == "stats":
+        cmd_session_stats(handler)
     else:
-        print("用法: mailcode session <list|show|delete|cleanup>", file=sys.stderr)
+        print("用法: mailcode session <list|show|delete|cleanup|stats>", file=sys.stderr)
         sys.exit(1)
 
 
@@ -276,7 +282,7 @@ def _cmd_config_validate(config: dict):
 
 def cmd_health(args):
     from mailcode.health import run_health
-    ok = run_health()
+    ok = run_health(send_test=getattr(args, "send", False))
     sys.exit(0 if ok else 1)
 
 
@@ -299,7 +305,7 @@ def build_parser():
             "  3) 校验配置   mailcode config validate\n"
             "  4) 自检连通性 mailcode health\n"
             "  5) 启动中继   mailcode serve                  # 长期后台运行 (默认 IDLE 长连接, 含定时任务调度器)\n"
-            "  6) 维护会话   mailcode session list|show|delete|cleanup\n"
+            "  6) 维护会话   mailcode session list|show|delete|cleanup|stats\n"
             "  7) 定时任务   mailcode schedule add/list|enable|disable|run-now\n"
             "\n"
             "调试提示:\n"
@@ -374,15 +380,18 @@ def build_parser():
     # ── session ──
     p_session = subparsers.add_parser(
         "session",
-        help="对话 session 管理 (list|show|delete|cleanup)",
+        help="对话 session 管理 (list|show|delete|cleanup|stats)",
         description=(
             "Session = 同一邮件主题下的多轮对话上下文, 以独立文件持久化。\n"
-            "用子命令 list/show/delete/cleanup 来维护这些 session。"
+            "用子命令 list/show/delete/cleanup/stats 来维护这些 session。"
         ),
     )
     p_session_sub = p_session.add_subparsers(dest="session_command", title="session 动作", metavar="<动作>")
 
-    p_session_sub.add_parser("list", help="列出全部 session (ID/发件人/主题/最近活动/消息数/工作目录)")
+    p_session_list = p_session_sub.add_parser("list", help="列出全部 session (ID/发件人/主题/最近活动/消息数/工作目录)")
+    p_session_list.add_argument("--wide", action="store_true", help="不截断显示")
+    p_session_list.add_argument("--filter", help="按发件人或主题关键词过滤")
+
     p_session_show = p_session_sub.add_parser("show",
         help="查看单个 session 的完整邮件流 (in/out 交替)")
     p_session_show.add_argument("session_id", help="12 位 hex session ID (从 list 中获取)")
@@ -397,6 +406,8 @@ def build_parser():
         help="按 TTL 清理过期 session (用 --dry-run 先预览)")
     p_session_cleanup.add_argument("--dry-run", action="store_true",
                                    help="只列出将被清理的 session, 不实际删除")
+
+    p_session_sub.add_parser("stats", help="显示 session 统计信息")
 
     # ── schedule ──
     p_schedule = subparsers.add_parser(
@@ -454,6 +465,15 @@ def build_parser():
     )
     p_schedule_run.add_argument("name", help="任务名称")
 
+    # -- chat --
+    p_chat = subparsers.add_parser(
+        "chat",
+        help="终端交互模式，直接与 Claude 对话（不经过邮件）",
+        description="启动交互式 REPL，输入内容直接发送给 Claude。支持 --session-id 恢复已有对话。",
+    )
+    p_chat.add_argument("--session-id", help="恢复已有对话的 session ID")
+    p_chat.add_argument("--cwd", default="", help="Claude 工作目录（默认当前目录）")
+
     return parser
 
 
@@ -479,6 +499,9 @@ def main():
         cmd_session(args)
     elif args.command == "schedule":
         cmd_schedule(args)
+    elif args.command == "chat":
+        from mailcode.cli_chat import cmd_chat
+        cmd_chat(args)
 
 if __name__ == "__main__":
     main()

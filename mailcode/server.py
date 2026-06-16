@@ -3,6 +3,7 @@
 import sys
 import signal
 import logging
+from datetime import datetime
 
 from mailcode.relay.email_listener import IMAPListener
 
@@ -16,6 +17,32 @@ def run_serve(args):
         args: 具有 dry_run、once、idle 属性的 Namespace 对象。
     """
     listener = IMAPListener()
+
+    # ---- 事件回调: 控制台实时输出 ----
+    def _console_echo(event, **data):
+        """打印事件到控制台。"""
+        now = datetime.now().strftime("%H:%M:%S")
+        if event == "email_received":
+            sender = data.get("sender_email", "")
+            subject = data.get("subject", "")
+            print(f"[{now}] 📬 收到  {sender}  →  {subject}", flush=True)
+        elif event == "claude_start":
+            sender = data.get("from_email", "")
+            subject = data.get("subject", "")
+            print(f"[{now}] 🤖 调 Claude  ({sender})", flush=True)
+        elif event == "reply_sent":
+            dur = data.get("duration", 0)
+            print(f"[{now}] ✅ 回复已发送  (耗时 {dur:.0f}s)", flush=True)
+        elif event == "claude_failed":
+            print(f"[{now}] ❌ Claude 处理失败", flush=True)
+        elif event == "heartbeat":
+            print(f"[{now}] 🔄 IDLE 心跳正常", flush=True)
+
+    listener.on("email_received", _console_echo)
+    listener.on("claude_start", _console_echo)
+    listener.on("reply_sent", _console_echo)
+    listener.on("claude_failed", _console_echo)
+    listener.on("heartbeat", _console_echo)
 
     # ---- 启动调度器 (--once 模式不启动) ----
     scheduler = None

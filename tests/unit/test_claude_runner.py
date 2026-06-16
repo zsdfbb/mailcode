@@ -132,6 +132,77 @@ class TestCallClaude:
         kwargs = mock_run.call_args[1]
         assert kwargs["input"] == prompt
 
+    #
+    # --- session_id / resume 参数测试 ---
+    #
+
+    def test_default_args_backward_compatible(self):
+        """无参数时 args 保持 ``["claude", "--dangerously-skip-permissions"]``。"""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+
+        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
+            cr_module.call_claude("hello")
+
+        args = mock_run.call_args[0][0]
+        assert args == ["claude", "--dangerously-skip-permissions"]
+
+    def test_session_id_only(self):
+        """仅传 session_id → args 包含 ``--session-id <id>``。"""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+
+        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
+            cr_module.call_claude("hello", session_id="sid-123")
+
+        args = mock_run.call_args[0][0]
+        assert args == [
+            "claude", "--dangerously-skip-permissions",
+            "--session-id", "sid-123",
+        ]
+
+    def test_session_id_and_resume(self):
+        """传 session_id + resume → args 包含 ``--session-id <id> --resume``。"""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+
+        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
+            cr_module.call_claude("hello", session_id="sid-456", resume=True)
+
+        args = mock_run.call_args[0][0]
+        assert args == [
+            "claude", "--dangerously-skip-permissions",
+            "--session-id", "sid-456",
+            "--resume",
+        ]
+
+    def test_session_id_reuse_errors(self):
+        """新参数下错误处理依然正常工作。"""
+        # nonzero exit
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "err"
+        mock_result.stdout = ""
+        with patch.object(subprocess, "run", return_value=mock_result):
+            assert cr_module.call_claude("hello", session_id="x") is None
+
+        # timeout
+        with patch.object(
+            subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=86400),
+        ):
+            assert cr_module.call_claude("hello", session_id="x", resume=True) is None
+
+        # file not found
+        with patch.object(subprocess, "run", side_effect=FileNotFoundError()):
+            assert cr_module.call_claude("hello", resume=False) is None
+
     def test_module_level_signature(self):
         """call_claude 是模块级函数, 可独立导入, 不依赖 handler 实例。"""
         import inspect
@@ -140,5 +211,7 @@ class TestCallClaude:
         params = list(sig.parameters.keys())
         assert "prompt" in params
         assert "cwd" in params
+        assert "session_id" in params
+        assert "resume" in params
         # 同样可从顶层 utils 包导入
         assert callable(call_claude)

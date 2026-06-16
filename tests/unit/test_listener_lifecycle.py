@@ -1,6 +1,8 @@
 """IMAPListener 生命周期测试 —— stop()、IDLE 回退、循环退出"""
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 from mailcode.relay.email_listener import IMAPListener
 
@@ -641,55 +643,55 @@ class TestProcessEmailRouting:
 
         | force_session | is_session_enabled() | 期望 handler        | mode            |
         |---------------|----------------------|--------------------|-----------------|
-        | True          | (任意)               | _handle_via_conversation | conversation   |
+        | True          | (任意)               | _handle_via_resume | resume          |
         | False         | (任意)               | _handle_via_stateless    | stateless      |
-        | None          | True                 | _handle_via_conversation | conversation   |
+        | None          | True                 | _handle_via_resume | resume          |
         | None          | False                | _handle_via_stateless    | stateless      |
         """
         listener = IMAPListener()
         entry = self._make_entry()
 
-        # 1) force_session=True → conversation
+        # 1) force_session=True → resume
         with patch("mailcode.relay.email_listener.is_session_enabled", return_value=False), \
-             patch.object(listener, "_handle_via_conversation",
-                          return_value=(True, "conversation")) as mock_conv, \
+             patch.object(listener, "_handle_via_resume",
+                          return_value=(True, "resume")) as mock_resume, \
              patch.object(listener, "_handle_via_stateless") as mock_stateless:
             success, mode = listener.process_email(entry, dry_run=False, force_session=True)
             assert success is True
-            assert mode == "conversation"
-            mock_conv.assert_called_once()
+            assert mode == "resume"
+            mock_resume.assert_called_once()
             mock_stateless.assert_not_called()
 
         # 2) force_session=False → stateless
         with patch("mailcode.relay.email_listener.is_session_enabled", return_value=True), \
-             patch.object(listener, "_handle_via_conversation") as mock_conv, \
+             patch.object(listener, "_handle_via_resume") as mock_resume, \
              patch.object(listener, "_handle_via_stateless",
                           return_value=(True, "stateless")) as mock_stateless:
             success, mode = listener.process_email(entry, dry_run=False, force_session=False)
             assert success is True
             assert mode == "stateless"
             mock_stateless.assert_called_once()
-            mock_conv.assert_not_called()
+            mock_resume.assert_not_called()
 
-        # 3) force_session=None + is_session_enabled()=True → conversation
+        # 3) force_session=None + is_session_enabled()=True → resume
         with patch("mailcode.relay.email_listener.is_session_enabled", return_value=True), \
-             patch.object(listener, "_handle_via_conversation",
-                          return_value=(True, "conversation")) as mock_conv, \
+             patch.object(listener, "_handle_via_resume",
+                          return_value=(True, "resume")) as mock_resume, \
              patch.object(listener, "_handle_via_stateless") as mock_stateless:
             success, mode = listener.process_email(entry, dry_run=False, force_session=None)
-            assert mode == "conversation"
-            mock_conv.assert_called_once()
+            assert mode == "resume"
+            mock_resume.assert_called_once()
             mock_stateless.assert_not_called()
 
         # 4) force_session=None + is_session_enabled()=False → stateless
         with patch("mailcode.relay.email_listener.is_session_enabled", return_value=False), \
-             patch.object(listener, "_handle_via_conversation") as mock_conv, \
+             patch.object(listener, "_handle_via_resume") as mock_resume, \
              patch.object(listener, "_handle_via_stateless",
                           return_value=(True, "stateless")) as mock_stateless:
             success, mode = listener.process_email(entry, dry_run=False, force_session=None)
             assert mode == "stateless"
             mock_stateless.assert_called_once()
-            mock_conv.assert_not_called()
+            mock_resume.assert_not_called()
 
     def test_dry_run_does_not_call_handlers(self, mock_config_patch):
         """dry_run=True 走 dry_run 路径, 不调任何 handler。"""
@@ -709,25 +711,25 @@ class TestProcessEmailRouting:
     def test_lazy_init_reuses_handler_instance(self, mock_config_patch):
         """二次调用复用同一 handler 实例 (lazy init 幂等)。
 
-        对 conversation 和 stateless 两条路径分别验证。
+        对 resume 和 stateless 两条路径分别验证。
         """
         listener = IMAPListener()
         entry = self._make_entry()
 
-        # conversation 路径
+        # resume 路径 (默认: _use_resume=True)
         with patch("mailcode.relay.email_listener.is_session_enabled", return_value=True), \
-             patch("mailcode.relay.conversation_handler.ConversationHandler") as MockCH:
+             patch("mailcode.relay.resume_handler.ResumeConversationHandler") as MockRH:
             mock_h = MagicMock()
             mock_h.handle_email.return_value = True
-            MockCH.return_value = mock_h
+            MockRH.return_value = mock_h
 
             listener.process_email(entry, dry_run=False, force_session=None)
-            first_id = id(listener._conv_handler)
+            first_id = id(listener._resume_handler)
             listener.process_email(entry, dry_run=False, force_session=None)
-            second_id = id(listener._conv_handler)
+            second_id = id(listener._resume_handler)
 
             assert first_id == second_id
-            assert MockCH.call_count == 1
+            assert MockRH.call_count == 1
             assert mock_h.handle_email.call_count == 2
 
         # stateless 路径
@@ -745,3 +747,64 @@ class TestProcessEmailRouting:
             assert first_id == second_id
             assert MockSH.call_count == 1
             assert mock_h.handle_email.call_count == 2
+
+
+class TestSystemCommands:
+    """系统命令路由测试。"""
+
+    @pytest.fixture
+    def listener_with_session(self, mock_config_patch):
+        """Create IMAPListener with mocked email channel + session enabled + resume mocked."""
+        listener = IMAPListener()
+        listener.email_channel.send_reply = MagicMock(return_value=None)
+        with patch("mailcode.relay.email_listener.is_session_enabled", return_value=True), \
+             patch.object(listener, "_handle_via_resume", return_value=(True, "resume")):
+            yield listener
+
+    def test_status_recognized(self, listener_with_session):
+        """主题为 status → 不走 resume handler。"""
+        entry = {
+            "sender_email": "u@t.com",
+            "subject": "status",
+            "body": "",
+            "references": "",
+            "in_reply_to": "",
+        }
+        success, mode = listener_with_session.process_email(entry)
+        assert success
+        assert mode == "system_status"
+
+    def test_help_recognized(self, listener_with_session):
+        """主题为 help → 不走 resume handler。"""
+        entry = {
+            "sender_email": "u@t.com",
+            "subject": "help",
+            "body": "",
+        }
+        success, mode = listener_with_session.process_email(entry)
+        assert success
+        assert mode == "system_help"
+
+    def test_sessions_recognized(self, listener_with_session):
+        """主题为 sessions → 不走 resume handler。"""
+        entry = {
+            "sender_email": "u@t.com",
+            "subject": "sessions",
+            "body": "",
+        }
+        success, mode = listener_with_session.process_email(entry)
+        assert success
+        assert mode == "system_sessions"
+
+    def test_normal_subject_goes_to_resume(self, listener_with_session):
+        """非系统命令主题 → 正常走 resume handler。"""
+        entry = {
+            "sender_email": "u@t.com",
+            "subject": "帮我看看代码",
+            "body": "帮我看一下这段代码有什么问题",
+            "references": "",
+            "in_reply_to": "",
+        }
+        success, mode = listener_with_session.process_email(entry)
+        # Should not be "system_*"
+        assert not mode.startswith("system_")

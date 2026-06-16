@@ -6,12 +6,13 @@ import json
 import random
 import re
 import socket
+import sys
 import time
 import threading
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 from email.header import decode_header
 from email.utils import parseaddr
 
@@ -21,6 +22,7 @@ from mailcode.relay.security import SecurityChecker
 
 if TYPE_CHECKING:
     from mailcode.relay.conversation_handler import ConversationHandler
+    from mailcode.relay.resume_handler import ResumeConversationHandler  # NEW
     from mailcode.relay.stateless_handler import StatelessHandler
 
 logger = logging.getLogger("mailcode")
@@ -70,7 +72,11 @@ class IMAPListener:
         self.security_checker = SecurityChecker()
         self.email_channel = EmailChannel(smtp_config=self.smtp_config, email_config=self.email_config)
         self._conv_handler: Optional["ConversationHandler"] = None
+        self._resume_handler: Optional["ResumeConversationHandler"] = None  # NEW
         self._stateless_handler: Optional["StatelessHandler"] = None
+        self._use_resume: bool = True  # NEW: default to new handler
+        # 事件回调注册表: event_type -> [callable, ...]
+        self._event_listeners: Dict[str, List[Callable]] = {}
 
         self.check_interval = self.email_config.get("check_interval", 5)
         self.processed_uids: set = set()
@@ -107,6 +113,18 @@ class IMAPListener:
                     mail.idle_done()
                 except Exception:
                     pass
+
+    def on(self, event: str, callback: Callable):
+        """注册事件回调。event: 'email_received'|'claude_start'|'claude_done'|'reply_sent'|'heartbeat'"""
+        self._event_listeners.setdefault(event, []).append(callback)
+
+    def _emit(self, event: str, **data):
+        """触发事件回调。"""
+        for cb in self._event_listeners.get(event, []):
+            try:
+                cb(event=event, **data)
+            except Exception as e:
+                logger.debug("事件回调异常 (%s): %s", event, e)
 
     def _load_state(self):
         """加载 state.json, 同步 self.processed_uids 和 self.sent_messages。"""
@@ -184,20 +202,25 @@ class IMAPListener:
         user = self.imap_config.get("user", "")
         password = self.imap_config.get("pass", "")
 
-        mail = imaplib.IMAP4_SSL(host, port)
-        mail.sock.settimeout(15)
-        # 部分邮件服务商（如网易）要求在登录前发送 ID 指令
         try:
-            mail._simple_command("ID", '("name" "mailcode" "vendor" "mailcode" "support-email" "' + user + '")')
-        except Exception:
-            pass
-        mail.login(user, password)
-        try:
-            mail._simple_command("ID", '("name" "mailcode" "vendor" "mailcode" "support-email" "' + user + '")')
-        except Exception:
-            pass
-        self._mail = mail
-        return mail
+            mail = imaplib.IMAP4_SSL(host, port)
+            mail.sock.settimeout(15)
+            # 部分邮件服务商（如网易）要求在登录前发送 ID 指令
+            try:
+                mail._simple_command("ID", '("name" "mailcode" "vendor" "mailcode" "support-email" "' + user + '")')
+            except Exception:
+                pass
+            mail.login(user, password)
+            try:
+                mail._simple_command("ID", '("name" "mailcode" "vendor" "mailcode" "support-email" "' + user + '")')
+            except Exception:
+                pass
+            self._mail = mail
+            return mail
+        except Exception as e:
+            logger.error("IMAP 连接失败: %s", e)
+            print(f"  ❌ IMAP 连接失败: {e}", file=sys.stderr)
+            raise
 
     def _wait_for_idle(self, mail: imaplib.IMAP4_SSL) -> bool:
         """阻塞等待 IMAP IDLE 事件. 返回 True=收到事件, False=超时/异常.
@@ -453,6 +476,7 @@ class IMAPListener:
 
                 results.append(entry)
                 self.processed_uids.add(uid)
+                self._emit("email_received", sender_email=sender_email, subject=subject, message_id=msg_id)
 
         except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
             # 瞬时网络/连接错误, 抛出由上层 _listen_idle 的退避循环处理
@@ -474,24 +498,119 @@ class IMAPListener:
 
         return results
 
+    @staticmethod
+    def _is_system_command(subject: str) -> Optional[str]:
+        """检查邮件主题是否为系统命令。返回命令名或 None。"""
+        if not subject:
+            return None
+        s = subject.strip().lower()
+        if s in ("status", "status?"):
+            return "status"
+        if s in ("help", "帮助", "?"):
+            return "help"
+        if s in ("sessions", "sessions?"):
+            return "sessions"
+        return None
+
+    def _handle_system_command(self, command: str, email_entry: Dict) -> Tuple[bool, str]:
+        """处理系统命令邮件, 直接回复不调 Claude。"""
+        from_email = email_entry.get("sender_email", "")
+        subject = email_entry.get("subject", "")
+
+        if command == "status":
+            # Get active session count
+            try:
+                mapping_file = _MAILCODE_HOME / "claude_sessions.json"
+                session_count = 0
+                if mapping_file.exists():
+                    import json
+                    with open(mapping_file) as f:
+                        data = json.load(f)
+                        session_count = len(data.get("threads", {}))
+            except Exception:
+                session_count = 0
+
+            body = (
+                "📊 MailCode 系统状态\n\n"
+                f"• 活跃对话: {session_count}\n"
+                f"• IMAP 监听: 运行中\n"
+                f"• 系统时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "发「help」查看使用帮助"
+            )
+        elif command == "help":
+            body = (
+                "📖 MailCode 使用指南\n\n"
+                "发送邮件到机器人邮箱, AI 会自动回复。\n\n"
+                "特殊命令（将主题设为以下内容）：\n"
+                "  status   — 查看系统状态\n"
+                "  help     — 查看本帮助\n"
+                "  sessions — 查看活跃对话列表\n\n"
+                "邮件正文支持:\n"
+                "  cwd: <路径> — 设置工作目录\n\n"
+                "更多信息: https://github.com/zsdfbb/mailcode"
+            )
+        elif command == "sessions":
+            try:
+                mapping_file = _MAILCODE_HOME / "claude_sessions.json"
+                if mapping_file.exists():
+                    import json
+                    with open(mapping_file) as f:
+                        data = json.load(f)
+                    threads = data.get("threads", {})
+                    if threads:
+                        lines = ["💬 活跃对话:\n"]
+                        for msg_id, info in sorted(
+                            threads.items(),
+                            key=lambda x: x[1].get("last_interaction", 0),
+                            reverse=True,
+                        ):
+                            subj = info.get("subject", "(无主题)")
+                            email = info.get("user_email", "")
+                            sid = info.get("claude_session_id", "")[:12]
+                            lines.append(f"  [{sid}] {subj}")
+                            lines.append(f"        {email}")
+                        body = "\n".join(lines)
+                    else:
+                        body = "💬 暂无活跃对话。\n\n发送任意邮件给机器人即可开始新对话。"
+                else:
+                    body = "💬 暂无活跃对话。"
+            except Exception:
+                body = "💬 读取对话列表时出错。"
+        else:
+            body = "未知命令。发「help」查看可用命令。"
+
+        try:
+            self.email_channel.send_reply(
+                to_email=from_email,
+                subject=f"Re: {subject}",
+                body=body,
+            )
+            return True, f"system_{command}"
+        except Exception as e:
+            logger.error("系统命令回复发送失败: %s", e)
+            return False, f"system_{command}_failed"
+
     def process_email(self, email_entry: Dict, dry_run: bool = False,
-                      force_session: Optional[bool] = None) -> Tuple[bool, str]:
-        """处理一封邮件: 路由到 conversation / stateless handler。
+                      force_session: Optional[bool] = None,
+                      force_resume: Optional[bool] = None) -> Tuple[bool, str]:
+        """处理一封邮件: 路由到 resume / conversation / stateless handler。
 
         路由表:
             dry_run=True                                       → (True, "dry_run")
-            force_session=True                                 → _handle_via_conversation
             force_session=False                                → _handle_via_stateless
-            force_session=None + is_session_enabled()=True     → _handle_via_conversation
             force_session=None + is_session_enabled()=False    → _handle_via_stateless
+            force_session=True/None + session enabled:
+                force_resume=True/None + self._use_resume=True → _handle_via_resume
+                force_resume=False                             → _handle_via_conversation
 
         Args:
             email_entry: fetch_unread_emails 产出的 entry dict
             dry_run: dry-run 模式, 仅日志, 不真发
             force_session: 显式覆盖 config 中 session.enabled
+            force_resume: 显式覆盖 self._use_resume 开关
 
         Returns:
-            (success: bool, mode: str), mode ∈ {"conversation", "stateless", "dry_run"}
+            (success: bool, mode: str), mode ∈ {"conversation", "resume", "stateless", "dry_run"}
         """
         if dry_run:
             logger.info(
@@ -499,18 +618,38 @@ class IMAPListener:
             )
             return True, "dry_run"
 
+        # System command check (before Claude routing)
+        cmd = self._is_system_command(email_entry.get("subject", ""))
+        if cmd:
+            return self._handle_system_command(cmd, email_entry)
+
         # 决定走 conversation 还是 stateless
         if force_session is None:
             use_conversation = is_session_enabled()
         else:
             use_conversation = force_session
 
-        if use_conversation:
-            return self._handle_via_conversation(email_entry)
-        return self._handle_via_stateless(email_entry)
+        if not use_conversation:
+            return self._handle_via_stateless(email_entry)
+
+        # 在会话模式下, 决定走 resume 还是旧 conversation
+        if force_resume is None:
+            use_resume = self._use_resume  # 默认 True
+        else:
+            use_resume = force_resume
+
+        if use_resume:
+            return self._handle_via_resume(email_entry)
+        return self._handle_via_conversation(email_entry)
 
     def _handle_via_conversation(self, email_entry: Dict) -> Tuple[bool, str]:
         """路由到 ConversationHandler, 处理多轮对话邮件。"""
+        from_email = email_entry["sender_email"]
+        subject = email_entry.get("subject", "")
+
+        t0 = time.monotonic()
+        self._emit("claude_start", from_email=from_email, subject=subject)
+
         if self._conv_handler is None:
             from mailcode.relay.conversation_handler import ConversationHandler
             self._conv_handler = ConversationHandler(
@@ -518,13 +657,51 @@ class IMAPListener:
             )
 
         success = self._conv_handler.handle_email(
-            from_email=email_entry["sender_email"],
-            subject=email_entry.get("subject", ""),
+            from_email=from_email,
+            subject=subject,
             body=email_entry.get("body", ""),
             references=email_entry.get("references", ""),
             in_reply_to=email_entry.get("in_reply_to", ""),
         )
+
+        duration = time.monotonic() - t0
+        if success:
+            self._emit("reply_sent", to_email=from_email, duration=duration)
+        else:
+            self._emit("claude_failed", to_email=from_email, duration=duration)
+
         mode = "conversation" if success else "conversation_failed"
+        return (success, mode)
+
+    def _handle_via_resume(self, email_entry: Dict) -> Tuple[bool, str]:
+        """路由到 ResumeConversationHandler, 使用 claude --resume。"""
+        from_email = email_entry["sender_email"]
+        subject = email_entry.get("subject", "")
+
+        t0 = time.monotonic()
+        self._emit("claude_start", from_email=from_email, subject=subject)
+
+        if self._resume_handler is None:
+            from mailcode.relay.resume_handler import ResumeConversationHandler
+            self._resume_handler = ResumeConversationHandler(
+                email_channel=self.email_channel,
+            )
+
+        success = self._resume_handler.handle_email(
+            from_email=from_email,
+            subject=subject,
+            body=email_entry.get("body", ""),
+            references=email_entry.get("references", ""),
+            in_reply_to=email_entry.get("in_reply_to", ""),
+        )
+
+        duration = time.monotonic() - t0
+        if success:
+            self._emit("reply_sent", to_email=from_email, duration=duration)
+        else:
+            self._emit("claude_failed", to_email=from_email, duration=duration)
+
+        mode = "resume" if success else "resume_failed"
         return (success, mode)
 
     def _handle_via_stateless(self, email_entry: Dict) -> Tuple[bool, str]:
@@ -533,9 +710,15 @@ class IMAPListener:
         - ``is_session_enabled()=False`` 时: 走 fallback (新默认)
         - ``force_session=False`` 时: 显式单次回复 (CLI 调试)
         """
+        from_email = email_entry["sender_email"]
+        subject = email_entry.get("subject", "")
+
         # 提示 fallback 路径, 但仅在"配置没开 session"时 (force_session=False 显式无歧义)
         if not is_session_enabled():
             logger.info("session 关闭, 使用单次回复")
+
+        t0 = time.monotonic()
+        self._emit("claude_start", from_email=from_email, subject=subject)
 
         if self._stateless_handler is None:
             from mailcode.relay.stateless_handler import StatelessHandler
@@ -544,12 +727,19 @@ class IMAPListener:
             )
 
         success = self._stateless_handler.handle_email(
-            from_email=email_entry["sender_email"],
-            subject=email_entry.get("subject", ""),
+            from_email=from_email,
+            subject=subject,
             body=email_entry.get("body", ""),
             references=email_entry.get("references", ""),
             in_reply_to=email_entry.get("in_reply_to", ""),
         )
+
+        duration = time.monotonic() - t0
+        if success:
+            self._emit("reply_sent", to_email=from_email, duration=duration)
+        else:
+            self._emit("claude_failed", to_email=from_email, duration=duration)
+
         mode = "stateless" if success else "stateless_failed"
         return (success, mode)
 
@@ -698,6 +888,7 @@ class IMAPListener:
                         logger.debug(f"IDLE 健康检查 iter={iteration}")
                         try:
                             mail.noop()
+                            self._emit("heartbeat")
                         except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
                             logger.warning(f"IDLE 健康检查失败 ({type(e).__name__}), 触发重连")
                             raise

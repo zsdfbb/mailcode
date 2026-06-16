@@ -15,17 +15,30 @@ logger = logging.getLogger(__name__)
 CLAUDE_TIMEOUT_SECONDS = 86400
 
 
-def call_claude(prompt: str, cwd: str = "") -> Optional[str]:
+def call_claude(
+    prompt: str,
+    cwd: str = "",
+    *,
+    session_id: Optional[str] = None,
+    resume: bool = False,
+) -> Optional[str]:
     """调用 ``claude`` 子进程 (stdin 传 prompt)。失败返回 None。
 
     Args:
         prompt: 完整 prompt
         cwd: 工作目录 (默认 ``Path.home()``)
+        session_id: 会话 ID, 传 ``--session-id`` 参数
+        resume: 续传已有会话 (需同时设置 session_id), 传 ``--resume`` 参数
     """
     cwd = cwd or str(Path.home())
+    args = ["claude", "--dangerously-skip-permissions"]
+    if session_id is not None:
+        args.extend(["--session-id", session_id])
+    if resume:
+        args.append("--resume")
     try:
         result = subprocess.run(
-            ["claude", "--dangerously-skip-permissions"],
+            args,
             input=prompt,
             capture_output=True,
             text=True,

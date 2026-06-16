@@ -2,7 +2,7 @@ import smtplib
 import imaplib
 import logging
 
-from mailcode.config import get_smtp_config, get_imap_config, get_email_config
+from mailcode.config import load_config, get_smtp_config, get_imap_config, get_email_config
 
 logger = logging.getLogger("mailcode")
 
@@ -15,7 +15,7 @@ def _check(label: str, ok: bool, detail: str = ""):
     return ok
 
 
-def run_health():
+def run_health(send_test: bool = True) -> bool:
     """运行邮件连通性检查"""
     print("MailCode Health Check\n")
 
@@ -35,6 +35,10 @@ def run_health():
     all_ok &= _check("IMAP 密码", bool(imap_cfg.get("pass")))
     all_ok &= _check("发件地址", bool(email_cfg.get("from")),
                       f"from={email_cfg.get('from')}")
+    config = load_config()
+    allowed = config.get("security", {}).get("allowed_senders", [])
+    all_ok &= _check("发件人白名单", bool(allowed),
+                      f"{len(allowed)} 个" if allowed else "空列表（serve 会拒绝所有邮件）")
 
     if not smtp_cfg.get("user") or not smtp_cfg.get("pass") or not imap_cfg.get("user") or not imap_cfg.get("pass"):
         print("\n  配置不完整，跳过网络检查")
@@ -73,16 +77,18 @@ def run_health():
     to_email = email_cfg.get("from", "")
     if to_email:
         try:
-            from_email = email_cfg.get("from", smtp_cfg["user"])
-            server.sendmail(smtp_cfg["user"], [to_email],
-                            f"From: {from_email}\nSubject: MailCode Health Check\n\nThis is a test email from MailCode health check.")
-            all_ok &= _check("发信", True, f"to={to_email}")
+            if send_test:
+                from_email = email_cfg.get("from", smtp_cfg["user"])
+                server.sendmail(smtp_cfg["user"], [to_email],
+                                f"From: {from_email}\nSubject: MailCode Health Check\n\nThis is a test email from MailCode health check.")
+                all_ok &= _check("发信", True, f"to={to_email}")
+            else:
+                _check("发信", True, "跳过 (未指定 --send)")
         except Exception as e:
             all_ok &= _check("发信", False, str(e))
     else:
-        if not to_email:
-            _check("发信", False, "未配置 mailcode_bot.email")
-            return all_ok
+        _check("发信", False, "未配置 mailcode_bot.email")
+        return all_ok
 
     server.quit()
 
