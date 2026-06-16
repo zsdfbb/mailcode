@@ -761,6 +761,11 @@ class IMAPListener:
                         # 重连时再认证失败 = 配置问题, 放弃
                         logger.error(f"IMAP 认证失败, 放弃重试: {auth_err}")
                         break
+                    except OSError as os_err:
+                        # 网络级错误 (DNS 解析失败等), 由外层退避循环继续重试
+                        logger.error(
+                            f"重连时网络错误 ({type(os_err).__name__}), 继续退避重试"
+                        )
                 except imaplib.IMAP4.error as e:
                     # 协议级错误 (非瞬时), 不退避直接退出让用户排查
                     self._active_idle_mail = None

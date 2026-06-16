@@ -409,6 +409,51 @@ class TestListenerLifecycle:
         assert select_idx < noop_idx, "NOOP 应在 SELECT 之后"
         assert noop_idx < search_idx, "NOOP 应在 SEARCH 之前"
 
+    def test_reconnect_gaierror_does_not_crash(self, mock_config_patch, caplog):
+        """修复: _reconnect 中 socket.gaierror 不导致循环崩溃, 而是退避重试"""
+        import logging
+        import socket
+        caplog.set_level(logging.ERROR)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        # _connect 首次成功 (初始连接), 后续失败 (重连时 DNS 挂)
+        connect_call_count = [0]
+        def fake_connect():
+            connect_call_count[0] += 1
+            if connect_call_count[0] >= 2:
+                raise socket.gaierror("[Errno -3] Temporary failure in name resolution")
+            return mock_mail
+
+        # 第一轮 IDLE 超时 → 外 handler 退避 → 重连 → gaierror
+        # 第二轮: 让 _wait_for_idle 抛 socket.timeout → 外 handler 再次退避
+        #          → 重连 → gaierror 再次被捕获 → 第三轮 ...
+        # N 轮后: 让 _wait_for_idle 返回 False, 然后立刻 set _stopped
+        wait_for_idle_calls = [0]
+        def fake_wait_for_idle(mail):
+            wait_for_idle_calls[0] += 1
+            if wait_for_idle_calls[0] >= 3:
+                listener._stopped.set()
+                return False
+            raise socket.timeout("timed out")
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", side_effect=fake_connect), \
+             patch.object(listener, "_wait_for_idle", side_effect=fake_wait_for_idle), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        # 验证: connect 被调用了多次 (初始 + 每次退避尝试)
+        assert connect_call_count[0] >= 2, f"应至少尝试 2 次连接, 实际 {connect_call_count[0]}"
+        # 验证: gaierror 被捕获后有日志 (不崩溃)
+        assert any("网络错误" in msg for msg in caplog.messages), \
+            f"Expected network error log. caplog: {caplog.messages}"
+
     def test_noop_after_reconnect_select(self, mock_config_patch):
         """Fix 4: _listen_idle 的 got_event 重连后执行 NOOP。"""
         listener = IMAPListener()
