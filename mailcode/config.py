@@ -98,7 +98,7 @@ def load_config(force_reload: bool = False) -> Dict[str, Any]:
             _config_cache = json.load(f)
         except json.JSONDecodeError:
             print(f"❌ 配置文件 {USER_CONFIG_PATH} 格式错误（不是有效的 JSON）", file=sys.stderr)
-            print(f"   请手动检查并修复该文件，或运行 mailcode config init --force 重新创建", file=sys.stderr)
+            print("   请手动检查并修复该文件，或运行 mailcode config init --force 重新创建", file=sys.stderr)
             sys.exit(1)
 
     return _config_cache

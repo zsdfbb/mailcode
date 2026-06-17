@@ -204,7 +204,7 @@ def cmd_session_stats(handler):
     newest = sorted_sessions[0] if sorted_sessions else None
     oldest = sorted_sessions[-1] if len(sorted_sessions) > 1 else None
 
-    print(f"Session 统计")
+    print("Session 统计")
     print(f"  总数:          {total}")
     print(f"  总消息数:      {total_msgs}")
     print(f"  平均消息数:    {total_msgs / total:.1f}" if total else "  平均消息数:    0")

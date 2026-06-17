@@ -456,7 +456,7 @@ class TestHandleEmail:
         """新消息创建 transcript 文件, 含 incoming + outgoing 两条 entry。"""
         mock_email_channel.send_reply.return_value = (True, "<trans-1@mailcode>")
 
-        with patch.object(cr_module, "call_claude", return_value="回复") as mock_call, \
+        with patch.object(cr_module, "call_claude", return_value="回复"), \
              patch("uuid.uuid4", return_value="uuid-for-transcript"):
             result = handler.handle_email(
                 from_email="user@test.com",
