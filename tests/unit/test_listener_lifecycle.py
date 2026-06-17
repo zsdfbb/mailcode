@@ -808,3 +808,103 @@ class TestSystemCommands:
         success, mode = listener_with_session.process_email(entry)
         # Should not be "system_*"
         assert not mode.startswith("system_")
+
+
+class TestIdleDenied:
+    """IMAP4.error 'idle denied' → ConnectionError → 退避重连"""
+
+    def test_wait_for_idle_new_raises_connection_error_on_imap_error(self, mock_config_patch):
+        """_wait_for_idle_new 捕获 IMAP4.error 后抛 ConnectionError"""
+        from imaplib import IMAP4
+        from mailcode.relay.email_listener import _NEW_IDLE_API
+        if not _NEW_IDLE_API:
+            pytest.skip("仅测试新 IDLE API 路径")
+
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        mock_mail.idle.return_value.__enter__.side_effect = IMAP4.error(
+            "idle denied: [b'System busy!']"
+        )
+
+        with pytest.raises(ConnectionError, match="IDLE 被服务器拒绝"):
+            listener._wait_for_idle_new(mock_mail)
+
+    def test_wait_for_idle_new_connection_error_preserves_abort(self, mock_config_patch):
+        """_wait_for_idle_new 保持 IMAP4.abort 原样传播 (不退化为 ConnectionError)"""
+        from imaplib import IMAP4
+        from mailcode.relay.email_listener import _NEW_IDLE_API
+        if not _NEW_IDLE_API:
+            pytest.skip("仅测试新 IDLE API 路径")
+
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        mock_mail.idle.return_value.__enter__.side_effect = IMAP4.abort(
+            "socket closed by server"
+        )
+
+        with pytest.raises(IMAP4.abort):
+            listener._wait_for_idle_new(mock_mail)
+
+    def test_idle_denied_triggers_backoff_reconnect(self, mock_config_patch, caplog):
+        """_listen_idle: idle-denied → backoff + reconnect, not crash or silent skip"""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        # 第一轮: IDLE 抛 ConnectionError (idle denied) → 退避+重连
+        # 第二轮: 正常退出
+        call_n = [0]
+        def fake_wait_for_idle(mail):
+            call_n[0] += 1
+            if call_n[0] == 1:
+                raise ConnectionError("IDLE 被服务器拒绝")
+            listener._stopped.set()
+            return False
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", side_effect=fake_wait_for_idle), \
+             patch.object(listener, "_reconnect", return_value=mock_mail) as mock_reconnect, \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        assert mock_reconnect.called, "应触发重连"
+        assert any("退避重连成功" in msg for msg in caplog.messages), \
+            f"Expected backoff reconnect log. caplog: {caplog.messages}"
+
+    def test_idle_denied_logs_connection_error(self, mock_config_patch, caplog):
+        """idle-denied 触发 _log_connection_error 输出（host:port / 尝试次数 / 延迟）"""
+        import logging
+        caplog.set_level(logging.ERROR)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        call_n = [0]
+        def fake_wait_for_idle(mail):
+            call_n[0] += 1
+            if call_n[0] == 1:
+                raise ConnectionError("IDLE 被服务器拒绝")
+            listener._stopped.set()
+            return False
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", side_effect=fake_wait_for_idle), \
+             patch.object(listener, "_reconnect", return_value=mock_mail), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        # _log_connection_error 应输出 IMAP 连接失败日志
+        assert any("连接失败" in msg for msg in caplog.messages), \
+            f"Expected connection failure log. caplog: {caplog.messages}"

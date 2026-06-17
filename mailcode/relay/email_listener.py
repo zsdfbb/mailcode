@@ -288,6 +288,10 @@ class IMAPListener:
             return False
         except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort):
             raise
+        except imaplib.IMAP4.error:
+            # 服务器拒绝 IDLE 指令（如 "System busy!"）是瞬时错误,
+            # 包装为 ConnectionError 让 _listen_idle 的退避+重连逻辑处理
+            raise ConnectionError("IDLE 被服务器拒绝")
         except Exception:
             logger.exception("IDLE 异常")
             return False

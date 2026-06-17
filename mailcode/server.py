@@ -19,8 +19,12 @@ def run_serve(args):
     listener = IMAPListener()
 
     # ---- 事件回调: 控制台实时输出 ----
+    _last_hb_print = 0.0
+    HB_PRINT_INTERVAL = 300  # 秒 — 心跳控制台打印间隔
+
     def _console_echo(event, **data):
         """打印事件到控制台。"""
+        nonlocal _last_hb_print
         now = datetime.now().strftime("%H:%M:%S")
         if event == "email_received":
             sender = data.get("sender_email", "")
@@ -36,7 +40,12 @@ def run_serve(args):
         elif event == "claude_failed":
             print(f"[{now}] ❌ Claude 处理失败", flush=True)
         elif event == "heartbeat":
-            print(f"[{now}] 🔄 IDLE 心跳正常", flush=True)
+            # 后台健康检查仍在 60s 执行, 但控制台打印降频避免刷屏
+            import time
+            t = time.monotonic()
+            if t - _last_hb_print >= HB_PRINT_INTERVAL:
+                _last_hb_print = t
+                print(f"[{now}] 🔄 IDLE 心跳正常  (每 {HB_PRINT_INTERVAL}s 显示一次)", flush=True)
 
     listener.on("email_received", _console_echo)
     listener.on("claude_start", _console_echo)
