@@ -1,6 +1,6 @@
 # MailCode
 
-Python 邮件连接器，通过邮件远程操控 Claude Code。
+Python 邮件连接器，通过邮件远程操控 AI 助手（Claude Code / OpenCode）。
 
 ```
 收件箱 ──> IMAP 监听器 ──> claude -p 子进程 ──> SMTP 邮件通知
@@ -98,17 +98,19 @@ SMTP 和 IMAP 配置由系统根据 Bot 邮箱的域名自动识别。支持：Q
 
 | 子命令 | 用途 |
 |--------|------|
-| `mailcode serve` | 启动 IMAP 监听中继（含定时任务调度器）|
+| `mailcode serve` | 启动 IMAP 监听中继（含定时任务调度器、控制台实时事件输出）|
+| `mailcode chat` | 终端交互模式，直接与 Claude 对话（不经过邮件）|
 | `mailcode schedule <动作>` | 定时任务管理（`list` / `show` / `add` / `enable` / `disable` / `delete` / `run-now` / `validate`）|
 | `mailcode config <动作>` | 配置管理（`show` / `init` / `init-test` / `path` / `validate`）|
-| `mailcode health` | 邮件连通性检查（SMTP/IMAP）|
-| `mailcode session <动作>` | 会话管理（`list` / `show` / `delete` / `cleanup`）|
+| `mailcode health [--send]` | 邮件连通性检查（SMTP/IMAP；`--send` 发送测试邮件验证发信）|
+| `mailcode session <动作>` | 会话管理（`list` / `show` / `delete` / `cleanup` / `stats`）|
 | `mailcode --version` | 显示版本号 |
 
 ### 启动中继
 
 ```bash
 # 前台运行（默认 IMAP IDLE 长连接, 单连接撑全场, 实时收信）
+# 运行中有实时事件输出: 📬 收到邮件  →  🤖 调 Claude  →  ✅ 回复已发送
 mailcode serve
 
 # 干跑模式（仅打印邮件, 不调用 claude）
@@ -149,14 +151,17 @@ mailcode config validate      # 校验配置完整性
 
 ### 会话管理
 
-MailCode 默认按邮件主题维护多轮对话; 如需单次回复模式请设 `session.enabled = false`。
+MailCode 默认按邮件主题维护多轮对话；如需单次回复模式请设 `session.enabled = false`。
 
 ```bash
-mailcode session list                # 列出所有 session
-mailcode session show <session_id>   # 查看单个 session 详情
-mailcode session delete <session_id> # 删除 session
-mailcode session cleanup             # 按 TTL 清理过期 session
-mailcode session cleanup --dry-run   # 仅预览，不实际删除
+mailcode session list                          # 列出全部 session
+mailcode session list --wide                   # 不截断显示（完整发件人/主题）
+mailcode session list --filter "关键词"        # 按发件人或主题过滤
+mailcode session show <session_id>             # 查看单个 session 完整邮件流
+mailcode session delete <session_id>           # 删除 session
+mailcode session stats                         # 统计信息（总数 / 活跃 / 过期）
+mailcode session cleanup                       # 按 TTL 清理过期 session
+mailcode session cleanup --dry-run             # 仅预览，不实际删除
 ```
 
 ### 工作目录 (cwd 指令)
@@ -182,13 +187,24 @@ cwd: ~/Projects/my-app
 
 cwd 行会在调用 Claude 前从 body 中剥离，不会污染 prompt。
 
-### 健康检查
+### 终端对话（Chat）
+
+无需经过邮件，直接在终端启动交互式 REPL 与 Claude 对话：
 
 ```bash
-mailcode health    # 检查 SMTP/IMAP 配置与连通性
+mailcode chat                    # 启动新对话
+mailcode chat --session-id <id>  # 恢复已有 session 继续对话
+mailcode chat --cwd ~/my-project # 指定工作目录
 ```
 
-检查项：SMTP 连接 / 登录 / 发信、IMAP 连接 / 登录 / 收件箱。
+适合快速调试或不想走邮件链路的场景。支持恢复 `serve` 中创建的 session（反之亦然）。
+
+```bash
+mailcode health        # 检查 SMTP/IMAP 配置与连通性
+mailcode health --send # 额外发送一封测试邮件验证发信通道
+```
+
+检查项：SMTP 连接 / 登录 / 发信、IMAP 连接 / 登录 / 收件箱、**发件人白名单是否为空**（serve 时白名单为空会拒绝所有邮件）。
 
 ### 定时任务
 
