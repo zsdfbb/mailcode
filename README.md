@@ -1,268 +1,270 @@
 # MailCode
 
-Python 邮件连接器，通过邮件远程操控 AI 助手（Claude Code / OpenCode）。
+Email ↔ AI Agent bidirectional remote command bridge. Control AI coding agents (Claude Code, OpenCode) via email — no dashboards, no webhooks, no chat apps.
 
 ```
-收件箱 ──> IMAP 监听器 ──> claude -p 子进程 ──> SMTP 邮件通知
+Inbox ──> IMAP Listener ──> claude -p subprocess ──> SMTP reply
 ```
 
-## 设计理念
+## Philosophy
 
-MailCode 的核心理念是**轻量化的人与 Coding Agent 直连**。
+MailCode's core idea is **lightweight, direct human-to-agent connection**.
 
-市面上的 AI 工具链往往依赖飞书、钉钉等重型协作平台——建机器人、配 Webhook、在对话框里和 Agent 来回聊天。MailCode 反其道而行：直接用邮件，因为你本来就有一个邮箱。
+Most AI toolchains rely on heavy collaboration platforms — Slack/Discord bots, webhook configurations, chat interfaces. MailCode does the opposite: it uses email, something you already have.
 
-**人与 Agent 直连，而不是和机器人对话。** 回复邮件就是下达指令，收件箱就是控制台,不需要打开任何第三方应用。
+**Direct connection, not a chatbot.** Replying to an email sends a command. Your inbox is your console. No third-party app required.
 
-**轻量异步。** 不需要常驻复杂服务，不需要数据库，不需要消息队列。一个 Python 脚本 + 邮件协议，跑在任何能联网的机器上。Agent 在后台慢慢跑，你做别的事，完事了邮件通知你。
+**Lightweight async.** No persistent services, no database, no message queue. One Python script + email protocol, runs on any machine with network access. The agent works in the background; you do other things; the result arrives in your inbox.
 
-MailCode 不做大而全的平台，只做一件事：**让你用最习惯的方式（邮件）和  Agent 对话。**
+MailCode doesn't aim to be a platform. It does one thing: **let you talk to an AI agent the way you already talk to people — through email.**
 
-## 邮箱账户架构
+## Email Architecture
 
-MailCode 需要 **两个邮箱账户**——一个当 Bot，一个当用户：
+MailCode requires **two email accounts** — one Bot, one User:
 
-- **Bot 邮箱**（例：`mailcode_bot@xxx.com`）—— MailCode 监听它的收件箱，Claude 处理完任务后通过它把结果发回给你
-- **用户邮箱**（你的私人邮箱，例：`your@qq.com`）—— 你从这个邮箱向 Bot 邮箱发邮件下达指令
+- **Bot mailbox** (e.g., `mailcode_bot@example.com`) — MailCode monitors its inbox. After Claude processes a task, results are sent back through this mailbox.
+- **User mailbox** (your personal email, e.g., `you@example.com`) — You send command emails from this address to the Bot mailbox.
 
-工作流：
+Flow:
 
 ```
-[用户邮箱]  ──发指令邮件──▶  [Bot 邮箱收件箱]
-  your@qq.com                  mailcode_bot@xxx.com
-                                      │
-                                      ▼
-                                 IMAP 监听
-                                      │
-                                      ▼
-                                 Claude 处理
-                                      │
-                                      ▼
-  [用户邮箱]  ◀──回复邮件──  [Bot 邮箱发件箱]
+[User Mailbox]  ──send command──▶  [Bot Mailbox Inbox]
+  you@example.com                   mailcode_bot@example.com
+                                           │
+                                           ▼
+                                      IMAP Listener
+                                           │
+                                           ▼
+                                      Claude Processing
+                                           │
+                                           ▼
+  [User Mailbox]  ◀──reply email──  [Bot Mailbox Outbox]
 ```
 
-> **为什么是 Bot 邮箱而不是你自己的主邮箱？** MailCode 要登录一个邮箱才能收信和发信，所以需要一个专用 Bot 邮箱；它和你日常使用的邮箱是分开的，配置 `allowed_senders` 限制只有你自己的私人邮箱能给它发指令。
+> **Why not use your own mailbox?** MailCode needs to log into a mailbox to read and send emails, so a dedicated Bot mailbox is required. It stays separate from your daily mailbox, and the `allowed_senders` config ensures only your personal email can send it commands.
 
-## 安装
+## Installation
 
-### 系统依赖
+### Prerequisites
 
-- **python3**（≥3.9）
-- **Claude Code**（`claude` 命令需在 `PATH` 中）
+- **python3** (≥3.9)
+- **Claude Code** (`claude` command must be in `PATH`)
 
-Python 零第三方依赖，全部使用标准库（`imaplib`、`smtplib`、`email`、`subprocess`、`json`、`secrets` 等）。
+Zero third-party Python dependencies — all standard library (`imaplib`, `smtplib`, `email`, `subprocess`, `json`, `secrets`, etc.).
 
-### pip 安装
+### pip install
 
 ```bash
 pip install mailcode
 ```
 
-### 源码安装
+### Source install
 
 ```bash
 git clone <repo-url> && cd MailCode
 bash install.sh
 ```
 
-`install.sh` 自动完成：安装 mailcode 包、初始化配置、创建 `~/.mailcode` 软链接、自动添加 PATH。
+`install.sh` automatically: installs the mailcode package, initializes config, creates `~/.mailcode` symlink, and adds to PATH.
 
-从本地 wheel 安装：`bash install.sh --local dist/mailcode-*.whl`
+Install from local wheel: `bash install.sh --local dist/mailcode-*.whl`
 
-## 配置
+## Configuration
 
-编辑 `~/.config/mailcode/config.json`，必填字段。**两个邮箱要分清楚**——`mailcode_bot.email` 是 Bot 邮箱，`security.allowed_senders` 是允许给它发指令的邮箱（通常是你自己的私人邮箱）：
+Edit `~/.config/mailcode/config.json` with required fields. **Keep the two mailboxes straight** — `mailcode_bot.email` is the Bot mailbox, `security.allowed_senders` lists the addresses allowed to send it commands (typically your personal email):
 
 ```jsonc
 {
   "mailcode_bot": {
-    "email": "mailcode_bot@xxx.com",    // ← Bot 邮箱：MailCode 登录此邮箱收信/回信
-    "password": "Bot 邮箱授权码",          // ← Bot 邮箱的授权码，不是登录密码
-    "check_interval": 60                  // ← 轮询间隔(秒); 163/126 推荐 60-120
+    "email": "mailcode_bot@example.com",  // ← Bot mailbox: MailCode logs into this
+    "password": "Bot mailbox app password", // ← App password, not your login password
+    "check_interval": 60                     // ← Poll interval (seconds); 163/126 recommend 60-120
   },
   "security": {
-    "allowed_senders": ["your@qq.com"]    // ← 允许发指令的邮箱（你的私人邮箱）
+    "allowed_senders": ["you@example.com"]   // ← Allowed command senders (your personal email)
   }
 }
 ```
 
-SMTP 和 IMAP 配置由系统根据 Bot 邮箱的域名自动识别。支持：QQ 邮箱、163/126 邮箱、Gmail、Outlook/Hotmail。
+SMTP and IMAP settings are auto-detected from the Bot mailbox domain. Supported providers: QQ Mail, 163/126 Mail, Gmail, Outlook/Hotmail.
 
-如需手动覆盖 SMTP/IMAP（如自建邮箱），可添加 `smtp` / `imap` 段，手动设置的值会覆盖自动识别结果。
+To override SMTP/IMAP (e.g., self-hosted email), add `smtp` / `imap` sections — manual values take precedence over auto-detection.
 
-> 授权码获取：QQ 邮箱 → 设置 → 账户 → POP3/IMAP → 生成授权码；Gmail → Google 账户 → 安全性 → 应用密码。
+> Getting an app password: QQ Mail → Settings → Account → POP3/IMAP → Generate authorization code. Gmail → Google Account → Security → App passwords.
 
-## 使用
+## Usage
 
-### CLI 概览
+### CLI Overview
 
-| 子命令 | 用途 |
-|--------|------|
-| `mailcode serve` | 启动 IMAP 监听中继（含定时任务调度器、控制台实时事件输出）|
-| `mailcode chat` | 终端交互模式，直接与 Claude 对话（不经过邮件）|
-| `mailcode schedule <动作>` | 定时任务管理（`list` / `show` / `add` / `enable` / `disable` / `delete` / `run-now` / `validate`）|
-| `mailcode config <动作>` | 配置管理（`show` / `init` / `init-test` / `path` / `validate`）|
-| `mailcode health [--send]` | 邮件连通性检查（SMTP/IMAP；`--send` 发送测试邮件验证发信）|
-| `mailcode session <动作>` | 会话管理（`list` / `show` / `delete` / `cleanup` / `stats`）|
-| `mailcode --version` | 显示版本号 |
+| Command | Description |
+|---------|-------------|
+| `mailcode serve` | Start IMAP listener relay (includes scheduler, real-time console events) |
+| `mailcode chat` | Terminal interactive mode — talk to Claude directly (no email) |
+| `mailcode schedule <action>` | Scheduled task management (`list`, `show`, `add`, `enable`, `disable`, `delete`, `run-now`, `validate`) |
+| `mailcode config <action>` | Configuration management (`show`, `init`, `init-test`, `path`, `validate`) |
+| `mailcode health [--send]` | Mail connectivity check (SMTP/IMAP; `--send` sends a test email) |
+| `mailcode session <action>` | Session management (`list`, `show`, `delete`, `cleanup`, `stats`) |
+| `mailcode --version` | Show version |
 
-### 启动中继
+### Start Relay
 
 ```bash
-# 前台运行（默认 IMAP IDLE 长连接, 单连接撑全场, 实时收信）
-# 运行中有实时事件输出: 📬 收到邮件  →  🤖 调 Claude  →  ✅ 回复已发送
+# Foreground (default: IMAP IDLE persistent connection, real-time email delivery)
+# Console output shows live events: 📬 email received → 🤖 invoking Claude → ✅ reply sent
 mailcode serve
 
-# 干跑模式（仅打印邮件, 不调用 claude）
+# Dry-run mode (print emails only, don't invoke claude)
 mailcode serve --dry-run
 
-# 强制走轮询（不用 IDLE; 部分老旧邮箱要求）
+# Force polling (disable IDLE; some legacy providers require this)
 mailcode serve --no-idle
 
-# 单次轮询后退出
+# Single poll then exit
 mailcode serve --once
 ```
 
-**IMAP IDLE 支持按邮箱而异**——MailCode 启动时检测 `IMAP CAPABILITY`, 没有 IDLE 就自动回退到轮询:
+**IMAP IDLE support varies by provider** — MailCode detects `IMAP CAPABILITY` on connect and falls back to polling if IDLE is unavailable:
 
-| 邮箱 | IDLE | 行为 | 推荐 `check_interval` |
-|------|------|------|----------------------|
-| QQ 邮箱 (`imap.qq.com`) | ✅ | 实时推送, 秒级响应 | 60s（轮询时）|
-| 163/126 邮箱 (`imap.163.com` / `imap.126.com`) | ❌ | 自动回退到轮询, warning 日志告知 | **60-120s**（频率过高会被反滥用限速, 严重时封 IP）|
-| Gmail / Outlook | ✅ | 实时推送 | 60s（轮询时）|
+| Provider | IDLE | Behavior | Recommended `check_interval` |
+|----------|------|----------|------------------------------|
+| QQ Mail (`imap.qq.com`) | ✅ | Real-time push, sub-second response | 60s (when polling) |
+| 163/126 Mail (`imap.163.com` / `imap.126.com`) | ❌ | Auto-fallback to polling, warning log | **60-120s** (excessive polling triggers anti-abuse rate limits, potentially IP ban) |
+| Gmail / Outlook | ✅ | Real-time push | 60s (when polling) |
 
-网易系邮箱**不支持 IDLE 扩展**, 频繁 IMAP 登录会触发反滥用。Bot 邮箱若用 163/126, 务必把 `mailcode_bot.check_interval` 调到 60-120 秒, 否则几小时内可能被临时封禁。
+NetEase (163/126) mailboxes **do not support IDLE**, and frequent IMAP logins trigger anti-abuse measures. If your Bot mailbox uses 163/126, set `mailcode_bot.check_interval` to 60–120 seconds to avoid temporary bans.
 
-查看日志：
+View logs:
 
 ```bash
 tail -f ~/.config/mailcode/relay.log
 ```
 
-### 配置管理
+### Configuration Management
 
 ```bash
-mailcode config show          # 查看当前配置（密码脱敏）
-mailcode config path          # 显示配置文件路径
-mailcode config init          # 初始化配置（已存在则跳过）
-mailcode config init --force  # 强制重新生成
-mailcode config validate      # 校验配置完整性
+mailcode config show          # View current config (passwords masked)
+mailcode config path          # Show config file path
+mailcode config init          # Initialize config (skip if exists)
+mailcode config init --force  # Force re-initialize
+mailcode config validate      # Validate config integrity
 ```
 
-### 会话管理
+### Terminal Chat
 
-MailCode 默认按邮件主题维护多轮对话；如需单次回复模式请设 `session.enabled = false`。
+Talk to Claude directly from the terminal without going through email:
 
 ```bash
-mailcode session list                          # 列出全部 session
-mailcode session list --wide                   # 不截断显示（完整发件人/主题）
-mailcode session list --filter "关键词"        # 按发件人或主题过滤
-mailcode session show <session_id>             # 查看单个 session 完整邮件流
-mailcode session delete <session_id>           # 删除 session
-mailcode session stats                         # 统计信息（总数 / 活跃 / 过期）
-mailcode session cleanup                       # 按 TTL 清理过期 session
-mailcode session cleanup --dry-run             # 仅预览，不实际删除
+mailcode chat                    # Start a new conversation
+mailcode chat --session-id <id>  # Resume an existing session
+mailcode chat --cwd ~/my-project # Set working directory
 ```
 
-### 工作目录 (cwd 指令)
+Useful for quick debugging or when you don't want to use the email channel. Sessions created in `serve` mode can be resumed in `chat` mode and vice versa.
 
-在邮件正文**第一行**写 `cwd: <path>`，Claude 子进程会在该目录启动——适合「让 Claude 操作指定项目」。Session 模式下 cwd **粘性**：同一 session 内的后续邮件会沿用该目录，直到新邮件重新指定。
+### Session Management
+
+MailCode maintains multi-turn conversations grouped by email subject by default. Set `session.enabled = false` for single-reply mode.
+
+```bash
+mailcode session list                          # List all sessions
+mailcode session list --wide                   # Full display (no truncation)
+mailcode session list --filter "keyword"       # Filter by sender or subject
+mailcode session show <session_id>             # View full message history
+mailcode session delete <session_id>           # Delete a session
+mailcode session stats                         # Statistics (total / active / expired)
+mailcode session cleanup                       # Clean up expired sessions by TTL
+mailcode session cleanup --dry-run             # Preview only, no deletion
+```
+
+### Working Directory (cwd directive)
+
+Put `cwd: <path>` on the **first line** of your email body to start the Claude subprocess in that directory — ideal for "Claude, work on this project." In session mode, the cwd is **sticky**: subsequent emails in the same session reuse the directory until a new one is specified.
 
 ```
 cwd: ~/Projects/my-app
-帮我看看 src/auth.py 里那段 JWT 校验逻辑
+Take a look at the JWT validation logic in src/auth.py
 ```
 
-**路径解析规则**：
+**Path resolution rules**:
 
-- `~` / `~/foo` 走用户目录展开
-- 相对路径（`./foo`、`foo`）以 `Path.cwd()` 为基准
-- 路径必须存在且是目录（`is_dir()` 校验），否则忽略并回退默认（`$HOME`）
-- 写法不区分大小写，`Cwd:` / `CWD:` 等价
+- `~` / `~/foo` expands to the user's home directory
+- Relative paths (`./foo`, `foo`) resolve from `Path.cwd()`
+- The path must exist and be a directory (`is_dir()` check); otherwise it falls back to `$HOME`
+- Case-insensitive: `Cwd:` / `CWD:` work the same way
 
-**两种模式差异**：
+**Mode differences**:
 
-- **Session 模式**（`session.enabled = true` 默认）：cwd 粘性，整个 session 沿用；`mailcode session show <id>` 可查当前 cwd
-- **单次回复模式**（`session.enabled = false`）：cwd 不粘性，每封邮件独立解析
+- **Session mode** (`session.enabled = true`, default): cwd is sticky across the entire session; check with `mailcode session show <id>`
+- **Single-reply mode** (`session.enabled = false`): cwd is not sticky, each email parses independently
 
-cwd 行会在调用 Claude 前从 body 中剥离，不会污染 prompt。
+The cwd line is stripped from the body before invoking Claude, so it never pollutes the prompt.
 
-### 终端对话（Chat）
-
-无需经过邮件，直接在终端启动交互式 REPL 与 Claude 对话：
+### Health Check
 
 ```bash
-mailcode chat                    # 启动新对话
-mailcode chat --session-id <id>  # 恢复已有 session 继续对话
-mailcode chat --cwd ~/my-project # 指定工作目录
+mailcode health        # Check SMTP/IMAP config and connectivity
+mailcode health --send # Also send a test email to verify the send channel
 ```
 
-适合快速调试或不想走邮件链路的场景。支持恢复 `serve` 中创建的 session（反之亦然）。
+Checks: SMTP connection / login / send, IMAP connection / login / inbox, **sender whitelist is not empty** (an empty whitelist rejects all incoming emails in serve mode).
+
+### Scheduled Tasks
+
+MailCode includes a lightweight scheduling engine — no external cron or systemd timer required. It runs inside `mailcode serve`, with persistence to `~/.config/mailcode/schedules.json`.
+
+Four schedule types:
+
+| Type | Parameters | Example |
+|------|------------|---------|
+| `interval` | `--interval-seconds <N>` | Every 3600 seconds |
+| `daily` | `--time <HH:MM>` | Every day at 09:00 |
+| `weekly` | `--time <HH:MM> --day-of-week <0-6>` | Every Monday at 09:00 (0=Sunday) |
+| `monthly` | `--time <HH:MM> --day-of-month <1-31>` | 1st of each month at 09:00 |
+
+Scheduled tasks invoke `claude -p <prompt>` and email the response to the configured recipient. All schedules are based on local time. Missed trigger windows are skipped (no catch-up).
 
 ```bash
-mailcode health        # 检查 SMTP/IMAP 配置与连通性
-mailcode health --send # 额外发送一封测试邮件验证发信通道
-```
-
-检查项：SMTP 连接 / 登录 / 发信、IMAP 连接 / 登录 / 收件箱、**发件人白名单是否为空**（serve 时白名单为空会拒绝所有邮件）。
-
-### 定时任务
-
-MailCode 内置轻量定时任务引擎，无需外部 cron 或 systemd timer——直接在 `mailcode serve` 内跑，配置持久化到 `~/.config/mailcode/schedules.json`。
-
-支持四种调度类型：
-
-| 类型 | 参数 | 示例 |
-|------|------|------|
-| `interval` | `--interval-seconds <秒>` | 每 3600 秒运行一次 |
-| `daily` | `--time <HH:MM>` | 每天 09:00 运行 |
-| `weekly` | `--time <HH:MM> --day-of-week <0-6>` | 每周一 09:00（0=周日） |
-| `monthly` | `--time <HH:MM> --day-of-month <1-31>` | 每月 1 号 09:00 |
-
-定时任务会调用 `claude -p <prompt>` 执行指定指令，并将 Claude 的响应邮件发送给指定收件人。所有调度基于本地时间，错过触发窗口的任务自动跳过（不会追赶补跑）。
-
-```bash
-# 创建定时任务
+# Create a scheduled task
 mailcode schedule add morning-digest --type daily --time 09:00 \
-  --prompt "总结 GitHub 通知, 列出今天待办" \
-  --to-email your@qq.com \
-  --subject-prefix "[晨间摘要]"
+  --prompt "Summarize GitHub notifications, list today's TODOs" \
+  --to-email you@example.com \
+  --subject-prefix "[Morning Digest]"
 
-# 列出所有任务
+# List all tasks
 mailcode schedule list
 
-# 查看任务详情
+# View task details
 mailcode schedule show morning-digest
 
-# 立即执行一次（不污染调度统计）
+# Execute immediately (doesn't affect schedule stats)
 mailcode schedule run-now morning-digest
 
-# 启用 / 禁用
+# Enable / Disable
 mailcode schedule enable morning-digest
 mailcode schedule disable morning-digest
 
-# 删除
+# Delete
 mailcode schedule delete morning-digest
 
-# 校验所有任务配置
+# Validate all task configs
 mailcode schedule validate
 ```
 
-**配置**（`~/.config/mailcode/config.json`，可选）：
+**Configuration** (`~/.config/mailcode/config.json`, optional):
 
 ```jsonc
 {
   "schedule": {
-    "enabled": true,         // 全局开关
-    "tick_seconds": 30       // 调度器轮询间隔
+    "enabled": true,         // Global toggle
+    "tick_seconds": 30       // Scheduler poll interval
   }
 }
 ```
 
-**特点**：
+**Features**:
 
-- **热加载**——通过 CLI 增删改任务后，运行中的 `serve` 进程立即生效，无需重启
-- **并发防护**——同一任务的上次执行未完成时，不会重复触发
-- **错误通知**——Claude 调用或邮件发送失败时，自动通知收件人
-- **独立运行**——`mailcode schedule run-now` 不依赖 `serve` 进程，可单独使用
-- **干跑兼容**——`mailcode serve --dry-run` 下标记执行结果但不真实调用
+- **Hot-reload** — tasks created/modified/deleted via CLI take effect immediately in a running `serve` process (no restart needed)
+- **Concurrency guard** — a task won't re-trigger while its previous run is still in progress
+- **Error notification** — if Claude or email sending fails, the configured recipient is notified automatically
+- **Standalone execution** — `mailcode schedule run-now` works without a running `serve` process
+- **Dry-run compatible** — `mailcode serve --dry-run` marks tasks as executed without actually running them
