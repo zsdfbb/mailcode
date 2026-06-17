@@ -65,13 +65,15 @@ class TestRunHealth:
         ok = run_health()
         assert ok is False
 
+    @patch("mailcode.health.load_config")
     @patch("mailcode.health.get_smtp_config")
     @patch("mailcode.health.get_imap_config")
     @patch("mailcode.health.get_email_config")
-    def test_all_ok_called(self, mock_email, mock_imap, mock_smtp):
+    def test_all_ok_called(self, mock_email, mock_imap, mock_smtp, mock_load_config):
         mock_smtp.return_value = _make_smtp_cfg(user="t", **{"pass": "p"})
         mock_imap.return_value = _make_imap_cfg(user="t", **{"pass": "p"})
         mock_email.return_value = _make_email_cfg(**{"from": "t@t.com", "to": "t@t.com"})
+        mock_load_config.return_value = {"security": {"allowed_senders": ["a@b.com"]}}
         with patch("mailcode.health.smtplib.SMTP_SSL") as mock_smtp_lib:
             mock_server = MagicMock()
             mock_smtp_lib.return_value = mock_server
