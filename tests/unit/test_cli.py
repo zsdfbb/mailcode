@@ -446,6 +446,89 @@ class TestSession:
 
 
 # ============================================================
+# state 子命令 (show / rebuild-baseline) — 运维恢复命令
+# ============================================================
+
+
+class TestState:
+    """state 子命令: show 当前 watermark/uid_validity, rebuild-baseline 重置。"""
+
+    def test_state_subcommand_registered(self):
+        """state 应注册为顶级子命令"""
+        parser = build_parser()
+        args = parser.parse_args(["state", "show"])
+        assert args.command == "state"
+        assert args.state_command == "show"
+
+    def test_state_show_invokes_listener(self, capsys):
+        """state show 调用 listener.get_state_summary"""
+        from mailcode.cli import cmd_state
+
+        with patch("mailcode.cli._build_state_listener") as mock_builder:
+            mock_listener = MagicMock()
+            mock_listener.get_state_summary.return_value = {
+                "watermark": 208,
+                "uid_validity": 1234567890,
+                "processed_uids_count": 3,
+                "sent_messages_count": 0,
+                "state_path": "/tmp/state.json",
+            }
+            mock_builder.return_value = mock_listener
+
+            class FakeArgs:
+                state_command = "show"
+
+            cmd_state(FakeArgs())
+            mock_listener.get_state_summary.assert_called_once()
+            out = capsys.readouterr().out
+            assert "208" in out
+            assert "1234567890" in out
+
+    def test_state_rebuild_baseline_invokes_listener(self, capsys):
+        """state rebuild-baseline 调用 listener.rebuild_baseline"""
+        from mailcode.cli import cmd_state
+
+        with patch("mailcode.cli._build_state_listener") as mock_builder:
+            mock_listener = MagicMock()
+            mock_listener.rebuild_baseline.return_value = {
+                "watermark": 0,
+                "uid_validity": None,
+                "cleared_uids": 3,
+            }
+            mock_builder.return_value = mock_listener
+
+            class FakeArgs:
+                state_command = "rebuild-baseline"
+                yes = True
+
+            cmd_state(FakeArgs())
+            mock_listener.rebuild_baseline.assert_called_once_with(assume_yes=True)
+            out = capsys.readouterr().out
+            assert "3" in out  # cleared_uids
+
+    def test_state_rebuild_baseline_without_yes_does_not_reset(self, capsys, tmp_path):
+        """rebuild-baseline 不带 --yes 时, 非交互环境直接拒绝 (默认行为)"""
+        from mailcode.cli import cmd_state
+
+        with patch("mailcode.cli._build_state_listener") as mock_builder:
+            mock_listener = MagicMock()
+            mock_builder.return_value = mock_listener
+
+            class FakeArgs:
+                state_command = "rebuild-baseline"
+                yes = False
+
+            # 默认应该走交互式确认, 这里 sys.stdin 不是 tty, 所以会拒绝
+            with patch("sys.stdin.isatty", return_value=False):
+                with pytest.raises(SystemExit) as exc_info:
+                    cmd_state(FakeArgs())
+                assert exc_info.value.code == 1
+            mock_listener.rebuild_baseline.assert_not_called()
+            err = capsys.readouterr().err
+            assert "yes" in err.lower() or "确认" in err
+
+
+# ============================================================
 # --config 参数 / MAILCODE_CONFIG 环境变量 测试
 # ============================================================
 

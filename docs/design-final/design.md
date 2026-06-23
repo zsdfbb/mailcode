@@ -90,7 +90,9 @@ MailCode 只负责"邮件 ↔ Claude Code"的中转,不做任何智能决策:
   "processed_uids": ["123", "124", ...],   // 已处理 UID 集合, 启动时基线
   "sent_messages": [                       // 已发邮件记录, 7 天滚动清理
     {"message_id": "<abc@example.com>", "thread_id": "...", "sent_at": "..."}
-  ]
+  ],
+  "highest_seen_uid": 208,                 // UID 水线: 下次 fetch 只拉 UID > 此值的邮件
+  "uid_validity": 1234567890               // IMAP UIDVALIDITY, 跳变时自动重置水线
 }
 ```
 
@@ -98,8 +100,14 @@ MailCode 只负责"邮件 ↔ Claude Code"的中转,不做任何智能决策:
 
 **守护进程生命周期**:
 - `mailcode serve` 作为长期运行的守护进程, 可与 `launchd` (macOS) / `systemd` (Linux) 配合实现开机自启
-- 启动时建基线: 现有 UNSEEN 邮件全部加到 `processed_uids`, 不处理历史邮件
+- 启动时建基线: 用 `UID SEARCH 1:*` 扫描所有邮件, 把现有 UID 全部加到 `processed_uids`, 记录 `highest_seen_uid` 和 `uid_validity`, **不依赖 UNSEEN 标志** (修复 2026-06-18 126 MailMaster 预读丢邮件 Bug)
+- 运行时: 每次 fetch 用 `UID SEARCH <watermark+1>:*` 增量拉取, 见新邮件推进 watermark
+- UIDVALIDITY 检测: 每次 `_connect()` 后检查服务器返回的 UIDVALIDITY, 与 state.json 比对; 跳变则重置 watermark=0 并 WARNING 告警, 推荐人工 `mailcode state rebuild-baseline` 重建基线
 - 关闭时: 断开 IMAP 连接 (`logout`), 原子写 `state.json`, 清理 7 天前的 `sent_messages`
+
+**运维命令** (`mailcode state`):
+- `mailcode state show`: 显示当前 watermark / UIDVALIDITY / processed_uids 数量 / state 文件路径
+- `mailcode state rebuild-baseline [--yes]`: 清空 watermark 和 processed_uids, 重新连 IMAP 扫描建立新基线 (历史邮件视为已处理, 不重发回复)
 
 ---
 

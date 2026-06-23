@@ -215,7 +215,8 @@ class TestListenerLifecycle:
 
         mock_mail = MagicMock()
         mock_mail.select.return_value = ("OK", [b"1"])
-        mock_mail.search.return_value = ("OK", [b"100"])
+        mock_mail.noop.return_value = ("OK", [None])
+        mock_mail.uid.return_value = ("OK", [b"100"])  # UID-based 增量拉取
         # 最小合法邮件
         raw = b"From: u@t.com\r\nSubject: test\r\n\r\nhello"
         mock_mail.fetch.return_value = ("OK", [(b"100 (BODY.PEEK[] {5}", raw)])
@@ -394,12 +395,13 @@ class TestListenerLifecycle:
         assert reconnect_calls[0] == 2
 
     def test_noop_after_select_in_fetch(self, mock_config_patch):
-        """Fix 4: fetch_unread_emails 在 SELECT 后立即 NOOP。"""
+        """Fix 4: fetch_unread_emails 在 SELECT 后立即 NOOP, UID SEARCH 在 NOOP 之后。"""
         listener = IMAPListener()
 
         mock_mail = MagicMock()
         mock_mail.select.return_value = ("OK", [b"1"])
-        mock_mail.search.return_value = ("OK", [b""])
+        mock_mail.noop.return_value = ("OK", [None])
+        mock_mail.uid.return_value = ("OK", [b""])
 
         results = listener.fetch_unread_emails(mail=mock_mail)
 
@@ -407,9 +409,9 @@ class TestListenerLifecycle:
         call_names = [c[0] for c in mock_mail.method_calls]
         select_idx = next(i for i, n in enumerate(call_names) if n == "select")
         noop_idx = next(i for i, n in enumerate(call_names) if n == "noop")
-        search_idx = next(i for i, n in enumerate(call_names) if n == "search")
+        uid_idx = next(i for i, n in enumerate(call_names) if n == "uid")
         assert select_idx < noop_idx, "NOOP 应在 SELECT 之后"
-        assert noop_idx < search_idx, "NOOP 应在 SEARCH 之前"
+        assert noop_idx < uid_idx, "UID SEARCH 应在 NOOP 之后"
 
     def test_reconnect_gaierror_does_not_crash(self, mock_config_patch, caplog):
         """修复: _reconnect 中 socket.gaierror 不导致循环崩溃, 而是退避重试"""
@@ -616,6 +618,188 @@ class TestListenerLifecycle:
         # 预期: 有日志说明 IDLE 事件后没有新邮件 (非新邮件的假通知)
         assert any("IDLE 事件后无新邮件" in msg for msg in caplog.messages), \
             f"Expected log about no new emails after IDLE event. caplog: {caplog.messages}"
+
+
+# ============================================================
+# UID watermark + UIDVALIDITY 检测 (修复: 已 Seen 邮件被永久忽略)
+# ============================================================
+
+
+class TestUidWatermark:
+    """`_init_baseline` 和 `fetch_unread_emails` 改用 UID SEARCH 增量拉取,
+    不依赖 UNSEEN 标志. 这样 126 MailMaster → QQ 中转时被预读标记的邮件也能被处理.
+
+    背景: 2026-06-18 用户从 126 MailMaster 发邮件, 126→QQ SMTP 中转时给邮件打
+    上 \\Seen 预读标记, QQ 收件箱收到时已是 Seen, MailCode 的 search UNSEEN
+    永远找不到, 邮件被永久忽略。
+    """
+
+    def test_init_baseline_uses_uid_search_not_unseen(self, mock_config_patch, tmp_path, caplog):
+        """_init_baseline 用 mail.uid('SEARCH', 'UID 1:*') 而非 mail.search(None, 'UNSEEN')"""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        # 隔离: 重定向 _MAILCODE_HOME 到 tmp_path, 使 listener 读不到真实 state.json
+        import mailcode.relay.email_listener as el_mod
+        original_home = el_mod._MAILCODE_HOME
+        el_mod._MAILCODE_HOME = tmp_path
+        try:
+            listener = IMAPListener()
+
+            mock_mail = MagicMock()
+            mock_mail.select.return_value = ("OK", [b"1"])
+            # 模拟邮箱里有 UID 200, 207, 208 三封邮件
+            mock_mail.uid.return_value = ("OK", [b"200 207 208"])
+            # UIDVALIDITY 返回值
+            mock_mail.response.return_value = "1234567890"
+
+            with patch.object(listener, "_connect", return_value=mock_mail):
+                listener._init_baseline()
+        finally:
+            el_mod._MAILCODE_HOME = original_home
+
+        # 必须用 mail.uid SEARCH, 不许用 mail.search UNSEEN
+        uid_calls = [c for c in mock_mail.method_calls if c[0] == "uid"]
+        assert len(uid_calls) >= 1, f"Expected mail.uid call, got: {mock_mail.method_calls}"
+        # 第一次 uid 调用的 args 应含 'UID 1:*'
+        first_uid_args = uid_calls[0][1]
+        assert "UID 1:*" in first_uid_args, f"Expected 'UID 1:*' in {first_uid_args}"
+
+        # 不应调用 UNSEEN search
+        search_calls = [c for c in mock_mail.method_calls if c[0] == "search"]
+        unseen_calls = [c for c in search_calls if "UNSEEN" in str(c)]
+        assert len(unseen_calls) == 0, f"UNSEEN 不应被调用: {search_calls}"
+
+        # watermark + uid_validity 应被记录
+        assert listener._highest_seen_uid == 208
+        assert listener._uid_validity == 1234567890
+        # 所有现有邮件加入 processed_uids (防重处理)
+        assert listener.processed_uids == {"200", "207", "208"}
+
+    def test_fetch_uses_uid_search_incremental_from_watermark(self, mock_config_patch):
+        """fetch_unread_emails 从 watermark+1 开始拉, 用 mail.uid 而非 mail.search"""
+        listener = IMAPListener()
+        listener._highest_seen_uid = 207  # 上次水线
+
+        mock_mail = MagicMock()
+        mock_mail.select.return_value = ("OK", [b"1"])
+        mock_mail.noop.return_value = ("OK", [None])
+        mock_mail.uid.return_value = ("OK", [b"208"])  # 只有新的一封
+        # 最小合法邮件
+        raw = b"From: u@t.com\r\nSubject: test\r\n\r\nhello"
+        mock_mail.fetch.return_value = ("OK", [(b"208 (BODY.PEEK[] {5}", raw)])
+
+        with patch.object(listener, "_is_own_message", return_value=False), \
+             patch.object(listener, "_is_duplicate", return_value=False), \
+             patch("mailcode.relay.email_listener.get_auth_policy", return_value="off"), \
+             patch.object(listener.security_checker, "is_sender_allowed", return_value=True):
+            listener.fetch_unread_emails(dry_run=True, mail=mock_mail)
+
+        # 检查调用: 必须用 mail.uid SEARCH 'UID 208:*'
+        uid_calls = [c for c in mock_mail.method_calls if c[0] == "uid"]
+        assert len(uid_calls) >= 1, f"Expected mail.uid call, got: {mock_mail.method_calls}"
+        first_uid_args = uid_calls[0][1]
+        assert "UID 208:*" in first_uid_args, f"Expected 'UID 208:*' in {first_uid_args}"
+
+        # 不能用 mail.search UNSEEN
+        search_calls = [c for c in mock_mail.method_calls if c[0] == "search"]
+        unseen_calls = [c for c in search_calls if "UNSEEN" in str(c)]
+        assert len(unseen_calls) == 0, f"UNSEEN 不应被调用: {search_calls}"
+
+        # watermark 应推进到 208
+        assert listener._highest_seen_uid == 208
+
+    def test_fetch_returns_already_seen_emails(self, mock_config_patch):
+        """回归测试: \\Seen 邮件也能被处理 (修复 126 MailMaster 预读丢邮件 Bug)"""
+        listener = IMAPListener()
+
+        mock_mail = MagicMock()
+        mock_mail.select.return_value = ("OK", [b"1"])
+        mock_mail.noop.return_value = ("OK", [None])
+        # 这封邮件虽然有 \\Seen 标志, 但 UID SEARCH 1:* 仍能找到它
+        mock_mail.uid.return_value = ("OK", [b"207"])
+        raw = b"From: u@t.com\r\nSubject: fenglaiindex\r\n\r\nbody"
+        # fetch 返回的 flags 含 \\Seen
+        mock_mail.fetch.return_value = ("OK", [(b"207 (UID 207 FLAGS (\\Seen) BODY.PEEK[] {10}", raw)])
+
+        with patch.object(listener, "_is_own_message", return_value=False), \
+             patch.object(listener, "_is_duplicate", return_value=False), \
+             patch("mailcode.relay.email_listener.get_auth_policy", return_value="off"), \
+             patch.object(listener.security_checker, "is_sender_allowed", return_value=True):
+            results = listener.fetch_unread_emails(dry_run=False, mail=mock_mail)
+
+        # 关键断言: 即使邮件是 \\Seen, 也应进入处理流程
+        assert len(results) == 1, f"\\Seen 邮件必须被处理, got: {results}"
+        assert results[0]["uid"] == "207"
+        # processed_uids 应包含 207 (防止重复)
+        assert "207" in listener.processed_uids
+        # watermark 应更新
+        assert listener._highest_seen_uid == 207
+
+    def test_uid_validity_change_resets_watermark_with_warning(self, mock_config_patch, caplog):
+        """UIDVALIDITY 跳变时, watermark 重置为 0 并打 WARNING 日志"""
+        import logging
+        caplog.set_level(logging.WARNING)
+
+        listener = IMAPListener()
+        # 模拟旧 state: 上次记录的 UIDVALIDITY=999, watermark=208
+        listener._uid_validity = 999
+        listener._highest_seen_uid = 208
+        listener.processed_uids = {"207", "208"}
+
+        mock_mail = MagicMock()
+        # 新连接的 UIDVALIDITY=1000 (QQ 重建了邮箱)
+        mock_mail.response.return_value = "1000"
+
+        listener._sync_uid_validity(mock_mail)
+
+        # watermark 重置, 旧 processed_uids 保留 (defense-in-depth)
+        assert listener._highest_seen_uid == 0
+        assert listener._uid_validity == 1000
+        # WARNING 日志应出现
+        assert any("UIDVALIDITY" in msg for msg in caplog.messages), \
+            f"Expected UIDVALIDITY warning. caplog: {caplog.messages}"
+
+    def test_uid_validity_unchanged_preserves_watermark(self, mock_config_patch):
+        """UIDVALIDITY 一致时, watermark 不动"""
+        listener = IMAPListener()
+        listener._uid_validity = 1234567890
+        listener._highest_seen_uid = 208
+
+        mock_mail = MagicMock()
+        mock_mail.response.return_value = "1234567890"
+
+        listener._sync_uid_validity(mock_mail)
+
+        # 都保持不变
+        assert listener._highest_seen_uid == 208
+        assert listener._uid_validity == 1234567890
+
+    def test_fetch_with_legacy_state_no_watermark(self, mock_config_patch):
+        """旧 state.json 没 watermark 时, fetch 从 UID 1:* 开始扫 (靠 processed_uids 去重)"""
+        listener = IMAPListener()
+        # 旧 state: 有 processed_uids 但 _highest_seen_uid 是 0
+        listener._highest_seen_uid = 0
+        listener.processed_uids = {"207", "208"}
+
+        mock_mail = MagicMock()
+        mock_mail.select.return_value = ("OK", [b"1"])
+        mock_mail.noop.return_value = ("OK", [None])
+        # 模拟邮箱里有 200, 207, 208 三封, 但 207/208 已在 processed_uids
+        mock_mail.uid.return_value = ("OK", [b"200 207 208"])
+        raw = b"From: u@t.com\r\nSubject: old\r\n\r\nbody"
+        mock_mail.fetch.return_value = ("OK", [(b"200 (BODY.PEEK[] {10}", raw)])
+
+        with patch.object(listener, "_is_own_message", return_value=False), \
+             patch.object(listener, "_is_duplicate", return_value=False), \
+             patch("mailcode.relay.email_listener.get_auth_policy", return_value="off"), \
+             patch.object(listener.security_checker, "is_sender_allowed", return_value=True):
+            listener.fetch_unread_emails(dry_run=True, mail=mock_mail)
+
+        # 应从 UID 1:* 扫描
+        uid_calls = [c for c in mock_mail.method_calls if c[0] == "uid"]
+        first_uid_args = uid_calls[0][1]
+        assert "UID 1:*" in first_uid_args, f"Expected 'UID 1:*' for legacy state, got: {first_uid_args}"
 
 
 # ============================================================

@@ -83,6 +83,17 @@ def _build_session_handler():
     return ConversationHandler(email_channel=channel)
 
 
+def _build_state_listener():
+    """构造 IMAPListener 实例, 供 `mailcode state` 子命令使用。
+
+    注意: listener 构造时会自动 _load_state() 读 state.json, 但不会连接 IMAP。
+    `show` 子命令仅读内存状态, 无需网络;
+    `rebuild-baseline` 会调用 listener.rebuild_baseline() 触发一次 IMAP 连接。
+    """
+    from mailcode.relay.email_listener import IMAPListener
+    return IMAPListener()
+
+
 def _build_schedule_store():
     """构造 ScheduleStore 实例（默认路径 ~/.config/mailcode/schedules.json）。"""
     from pathlib import Path
@@ -286,6 +297,48 @@ def cmd_health(args):
     sys.exit(0 if ok else 1)
 
 
+def cmd_state(args):
+    """state 子命令: show 当前水线 / rebuild-baseline 重建基线。"""
+    sub = getattr(args, "state_command", None)
+    if sub is None:
+        print("用法: mailcode state <show|rebuild-baseline>", file=sys.stderr)
+        sys.exit(1)
+
+    listener = _build_state_listener()
+
+    if sub == "show":
+        summary = listener.get_state_summary()
+        print("📊 MailCode 监听状态")
+        print(f"   UID watermark:    {summary['watermark']}")
+        print(f"   UIDVALIDITY:      {summary['uid_validity']}")
+        print(f"   processed_uids:   {summary['processed_uids_count']} 个")
+        print(f"   sent_messages:    {summary['sent_messages_count']} 个")
+        print(f"   state 文件:       {summary['state_path']}")
+    elif sub == "rebuild-baseline":
+        # 交互式确认 (避免误操作清空所有 processed_uids)
+        if not getattr(args, "yes", False):
+            if not sys.stdin.isatty():
+                print("❌ 非交互环境必须加 --yes 确认", file=sys.stderr)
+                sys.exit(1)
+            print("⚠️  即将清空 watermark 和 processed_uids, 并重新扫描邮箱建基线。")
+            print("    历史邮件会被视为已处理 (不会重发回复)。")
+            try:
+                answer = input("    确认执行? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            if answer != "y":
+                print("已取消")
+                return
+        result = listener.rebuild_baseline(assume_yes=True)
+        print("✅ 基线已重建")
+        print(f"   清空 processed_uids: {result['cleared_uids']} 个")
+        print(f"   新 watermark:        {result['watermark']}")
+        print(f"   新 UIDVALIDITY:      {result['uid_validity']}")
+    else:
+        print("用法: mailcode state <show|rebuild-baseline>", file=sys.stderr)
+        sys.exit(1)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="mailcode",
@@ -311,7 +364,8 @@ def build_parser():
             "调试提示:\n"
             "  • 想看收到什么邮件但不想执行: mailcode serve --once --dry-run\n"
             "  • 想用临时配置:                  mailcode --config /tmp/x.json <子命令>\n"
-            "  • 集成测试配置:                  mailcode config init-test"
+            "  • 集成测试配置:                  mailcode config init-test\n"
+            "  • 重建监听水线:                  mailcode state rebuild-baseline"
         ),
     )
     parser.add_argument("--version", action="version", version=f"mailcode {__version__}")
@@ -376,6 +430,30 @@ def build_parser():
     )
     p_health.add_argument("--send", action="store_true",
                         help="额外发一封自检邮件到 bot 自身 (默认只检查连接与登录)")
+
+    # ── state ──
+    p_state = subparsers.add_parser(
+        "state",
+        help="查看/重建监听水线 (show|rebuild-baseline)",
+        description=(
+            "管理 IMAP 监听状态 (UID watermark / UIDVALIDITY / processed_uids)。\n"
+            "日常用 `show` 查看; UIDVALIDITY 跳变后或怀疑状态污染时用 `rebuild-baseline`。"
+        ),
+    )
+    p_state_sub = p_state.add_subparsers(dest="state_command", title="state 动作", metavar="<动作>")
+    p_state_sub.add_parser("show", help="显示当前 watermark / UIDVALIDITY / processed_uids 数量")
+    p_state_rebuild = p_state_sub.add_parser(
+        "rebuild-baseline",
+        help="清空 watermark + processed_uids 并重新扫描邮箱建基线",
+        description=(
+            "清空 UID watermark 和 processed_uids, 重新扫描邮箱建立新基线。\n"
+            "历史邮件会被视为已处理 (不会重发回复); 后续新邮件正常处理。\n"
+            "适用: UIDVALIDITY 跳变后恢复、怀疑 processed_uids 被污染。\n"
+            "默认要求交互确认; --yes 跳过 (用于脚本)。"
+        ),
+    )
+    p_state_rebuild.add_argument("-y", "--yes", action="store_true",
+                                 help="跳过交互式确认")
 
     # ── session ──
     p_session = subparsers.add_parser(
@@ -499,6 +577,8 @@ def main():
         cmd_session(args)
     elif args.command == "schedule":
         cmd_schedule(args)
+    elif args.command == "state":
+        cmd_state(args)
     elif args.command == "chat":
         from mailcode.cli_chat import cmd_chat
         cmd_chat(args)

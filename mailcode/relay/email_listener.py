@@ -81,6 +81,12 @@ class IMAPListener:
         self.check_interval = self.email_config.get("check_interval", 5)
         self.processed_uids: set = set()
         self.sent_messages: list = []
+        # UID watermark: 上次见过的最大 UID。下次 fetch 只拉 UID > watermark 的邮件。
+        # 配合 UIDVALIDITY 检测, 实现不依赖 \\Seen 标志的增量拉取。
+        # 背景: 2026-06-18 用户从 126 MailMaster 发邮件, 中转时邮件被预读打 \\Seen,
+        # MailCode 旧的 search UNSEEN 永远找不到, 邮件永久丢失。
+        self._highest_seen_uid: int = 0
+        self._uid_validity: Optional[int] = None
         self._load_state()
 
         self._idle_timeout = 5
@@ -127,22 +133,50 @@ class IMAPListener:
                 logger.debug("事件回调异常 (%s): %s", event, e)
 
     def _load_state(self):
-        """加载 state.json, 同步 self.processed_uids 和 self.sent_messages。"""
+        """加载 state.json, 同步 self.processed_uids / self.sent_messages / UID 水线。
+
+        字段向后兼容:
+        - 旧 state.json 缺 highest_seen_uid 时, 从 max(int(u) for u in processed_uids if u.isdigit()) 推导
+        - 旧 state.json 缺 uid_validity 时, 留 None (下次 _sync_uid_validity 会重新记录)
+        """
         if not self.state_path.exists():
             self.processed_uids = set()
             self.sent_messages = []
+            self._highest_seen_uid = 0
+            self._uid_validity = None
             return
         try:
             with open(self.state_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.processed_uids = set(data.get("processed_uids", []))
             self.sent_messages = list(data.get("sent_messages", []))
+
+            # UID watermark (向后兼容)
+            stored_watermark = data.get("highest_seen_uid")
+            if stored_watermark is not None:
+                self._highest_seen_uid = int(stored_watermark)
+            else:
+                # 旧 state: 推导最大 UID (忽略非数字残留)
+                int_uids = [int(u) for u in self.processed_uids if u.isdigit()]
+                self._highest_seen_uid = max(int_uids) if int_uids else 0
+
+            # UIDVALIDITY (向后兼容)
+            stored_validity = data.get("uid_validity")
+            self._uid_validity = int(stored_validity) if stored_validity is not None else None
         except Exception:
             self.processed_uids = set()
             self.sent_messages = []
+            self._highest_seen_uid = 0
+            self._uid_validity = None
 
     def _save_state(self, state: dict):
-        """原子写 state 到 state.json。state 应包含 processed_uids + sent_messages。"""
+        """原子写 state 到 state.json。state 应包含 processed_uids + sent_messages + UID 水线。
+
+        调用方通常传 dict, 我们补上 watermark 和 uid_validity 后再写。
+        """
+        # 始终把当前 watermark + uid_validity 写入, 防止调用方遗漏
+        state.setdefault("highest_seen_uid", self._highest_seen_uid)
+        state.setdefault("uid_validity", self._uid_validity)
         tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
@@ -181,20 +215,75 @@ class IMAPListener:
             )
 
     def _init_baseline(self):
-        """建立启动基线：将当前所有 UNSEEN 邮件标记为已处理，后续只响应新邮件"""
+        """建立启动基线：用 UID SEARCH 1:* 扫描所有邮件, 记录 watermark + UIDVALIDITY,
+        把所有现有邮件加入 processed_uids 防止重处理。"""
         try:
             mail = self._connect()
             mail.select("INBOX")
-            status, messages = mail.search(None, "UNSEEN")
-            if status == "OK" and messages[0]:
+            # 同步 UIDVALIDITY (若上次 state.json 有记录且不一致, 会重置 watermark)
+            self._sync_uid_validity(mail)
+
+            # 拉所有邮件 UID, 全部加入 processed_uids + 计算 watermark
+            status, data = mail.uid("SEARCH", "UID 1:*")
+            if status == "OK" and data[0]:
                 count = 0
-                for uid_bytes in messages[0].split():
-                    self.processed_uids.add(uid_bytes.decode())
+                max_uid = self._highest_seen_uid
+                for uid_bytes in data[0].split():
+                    uid = uid_bytes.decode()
+                    self.processed_uids.add(uid)
+                    uid_int = int(uid) if uid.isdigit() else 0
+                    if uid_int > max_uid:
+                        max_uid = uid_int
                     count += 1
-                logger.info(f"邮件基线已建立: {count} 封历史未读邮件不处理")
+                if max_uid > self._highest_seen_uid:
+                    self._highest_seen_uid = max_uid
+                logger.info(
+                    f"邮件基线已建立: {count} 封历史邮件已跳过, "
+                    f"watermark={self._highest_seen_uid}, uid_validity={self._uid_validity}"
+                )
             mail.logout()
         except Exception as e:
             logger.warning(f"建立邮件基线失败: {e}")
+
+    def _sync_uid_validity(self, mail: imaplib.IMAP4_SSL) -> None:
+        """检测 IMAP UIDVALIDITY 是否变化, 变化则重置 watermark。
+
+        UIDVALIDITY 含义 (RFC 3501 §2.3.1.1): 邮箱的唯一标识, 改变时所有 UID 失效。
+        触发场景: QQ 邮箱后台重建索引、账号迁移、文件夹重建等。
+        重置 watermark=0 后, 下次 fetch 从 UID 1:* 扫描 (靠 processed_uids 去重),
+        避免因 UID 跳变漏掉新邮件。
+        """
+        try:
+            # imaplib 把 SELECT 的扩展响应存在 mail.response dict 里,
+            # 形如 {'UIDVALIDITY': ['1234567890']} 或 {'UIDVALIDITY': '1234567890'}
+            resp = mail.response("UIDVALIDITY")
+            if isinstance(resp, list) and resp:
+                new_validity = int(resp[0])
+            elif isinstance(resp, str):
+                new_validity = int(resp)
+            else:
+                logger.debug("UIDVALIDITY 响应格式未知, 跳过检查: %r", resp)
+                return
+        except Exception as e:
+            logger.debug("读取 UIDVALIDITY 失败 (服务器可能未报告): %s", e)
+            return
+
+        if self._uid_validity is None:
+            # 首次连接 / 旧 state 无记录: 直接记录新值, 不重置 watermark
+            self._uid_validity = new_validity
+            logger.info("记录 UIDVALIDITY=%d (首次)", new_validity)
+            return
+
+        if new_validity != self._uid_validity:
+            logger.warning(
+                "UIDVALIDITY 变化: 旧=%d → 新=%d, watermark 重置为 0, "
+                "processed_uids 保留作 defense-in-depth。建议人工确认是否需要重建基线 "
+                "(mailcode state rebuild-baseline)",
+                self._uid_validity, new_validity,
+            )
+            self._uid_validity = new_validity
+            self._highest_seen_uid = 0
+        # 一致则保持不变
 
     def _connect(self) -> imaplib.IMAP4_SSL:
         host = self.imap_config.get("host", "imap.qq.com")
@@ -401,23 +490,35 @@ class IMAPListener:
             if owns_connection:
                 mail = self._connect()
             mail.select("INBOX")
+            # 同步 UIDVALIDITY (QQ 重建邮箱时, 此处会重置 watermark)
+            self._sync_uid_validity(mail)
             # NOOP 刷新任何残留的挂起响应, 避免后续 SEARCH 读到错误响应
             try:
                 mail.noop()
             except Exception:
                 pass
 
-            status, messages = mail.search(None, "UNSEEN")
+            # UID-based 增量拉取 (不依赖 \\Seen 标志)
+            # watermark=0 时扫 UID 1:* (冷启动或 UIDVALIDITY 跳变后)
+            if self._highest_seen_uid > 0:
+                search_range = f"UID {self._highest_seen_uid + 1}:*"
+            else:
+                search_range = "UID 1:*"
+            status, data = mail.uid("SEARCH", search_range)
             if status != "OK":
                 return results
 
-            uids = messages[0].split()
+            uids = data[0].split()
             if not uids:
-                logger.info("SEARCH UNSEEN 无结果 (可能收到非新邮件的 IMAP 通知)")
+                logger.info(f"UID SEARCH {search_range} 无结果 (可能收到非新邮件的 IMAP 通知)")
                 return results
 
             for uid_bytes in uids:
                 uid = uid_bytes.decode()
+                # 推进 watermark: 见到这个 UID 就认为"水线已至此"
+                uid_int = int(uid) if uid.isdigit() else 0
+                if uid_int > self._highest_seen_uid:
+                    self._highest_seen_uid = uid_int
                 status, msg_data = mail.fetch(uid_bytes, "(BODY.PEEK[])")
                 if status != "OK":
                     continue
@@ -973,6 +1074,70 @@ class IMAPListener:
                     mail.logout()
                 except Exception:
                     pass
+
+    # ============================================================
+    # 运维命令支持 (mailcode state show / rebuild-baseline)
+    # ============================================================
+
+    def get_state_summary(self) -> dict:
+        """返回当前水线状态, 供 `mailcode state show` 打印。
+
+        不连接 IMAP, 仅读内存状态 (即最近一次 _load_state / fetch 后的值)。
+        """
+        return {
+            "watermark": self._highest_seen_uid,
+            "uid_validity": self._uid_validity,
+            "processed_uids_count": len(self.processed_uids),
+            "sent_messages_count": len(self.sent_messages),
+            "state_path": str(self.state_path),
+        }
+
+    def rebuild_baseline(self, assume_yes: bool = False) -> dict:
+        """清空 watermark 和 processed_uids, 重新扫描一次邮箱建立基线。
+
+        适用场景:
+        - UIDVALIDITY 跳变后想从最新 UID 重新开始
+        - 怀疑 processed_uids 被污染 (例如手改了 state.json)
+        - 历史邮件被错误处理, 想清空重来
+
+        Args:
+            assume_yes: True = 不打印确认信息直接执行 (CLI --yes)
+
+        Returns:
+            {"watermark": int, "uid_validity": int, "cleared_uids": int}
+        """
+        cleared = len(self.processed_uids)
+
+        # 重置内存状态
+        self._highest_seen_uid = 0
+        self._uid_validity = None
+        self.processed_uids = set()
+
+        # 立即落盘: processed_uids=[] + watermark=0, 即使后续 _init_baseline 失败也安全
+        self._save_state({
+            "processed_uids": [],
+            "sent_messages": [],  # rebuild-baseline 也清空 sent_messages (顺带)
+        })
+
+        # 重新连 IMAP 建基线 (会更新 watermark + uid_validity + 重新扫描 processed_uids)
+        self._init_baseline()
+
+        # 再落一次盘, 把 _init_baseline 后的 watermark 持久化
+        self._save_state({
+            "processed_uids": list(self.processed_uids),
+            "sent_messages": self.sent_messages,
+        })
+
+        logger.info(
+            "rebuild-baseline 完成: 清空 %d 个 processed_uids, "
+            "新 watermark=%d, uid_validity=%s",
+            cleared, self._highest_seen_uid, self._uid_validity,
+        )
+        return {
+            "watermark": self._highest_seen_uid,
+            "uid_validity": self._uid_validity,
+            "cleared_uids": cleared,
+        }
 
 
 if __name__ == "__main__":
