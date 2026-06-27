@@ -39,6 +39,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from mailcode.config import get_schedule_config
 from mailcode.utils.claude_runner import call_claude
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,8 @@ class Task:
         next_run_at: 下次计划触发时间 (ISO8601 字符串)
         created_at: 创建时间 (ISO8601 字符串)
         updated_at: 更新时间 (ISO8601 字符串)
+        timeout_seconds: 单任务超时 (秒); None 时回退到
+            ``get_schedule_config()["default_timeout_seconds"]``
     """
 
     id: str
@@ -154,6 +157,7 @@ class Task:
     next_run_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    timeout_seconds: Optional[int] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -180,6 +184,7 @@ class Task:
             next_run_at=d.get("next_run_at"),
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
+            timeout_seconds=d.get("timeout_seconds"),
         )
 
 
@@ -712,8 +717,14 @@ class Scheduler(threading.Thread):
             return True, None
 
         # 调 Claude
+        # timeout: task 自身字段优先, 否则从 config 取默认值, 最后兜底 1800s
+        if task.timeout_seconds is not None:
+            effective_timeout = task.timeout_seconds
+        else:
+            cfg = get_schedule_config()
+            effective_timeout = cfg.get("default_timeout_seconds", 1800)
         try:
-            claude_output = call_claude(task.prompt, task.cwd)
+            claude_output = call_claude(task.prompt, task.cwd, timeout=effective_timeout)
         except Exception as e:
             err = f"call_claude 异常: {e}"
             logger.error("Scheduler call_claude 失败 id=%s: %s", task.id, e)

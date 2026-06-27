@@ -204,6 +204,7 @@ SCHEDULE_DEFAULTS = {
     "tick_seconds": 30,
     "max_concurrent": 1,
     "missed_run_policy": "skip",  # v1 仅支持 skip, v2 加 run_immediately
+    "default_timeout_seconds": 1800,  # 子任务 claude 子进程默认超时 (30 分钟)
 }
 
 

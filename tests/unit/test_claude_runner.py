@@ -10,6 +10,7 @@
   - 函数是模块级, 可独立导入
 """
 
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -213,5 +214,127 @@ class TestCallClaude:
         assert "cwd" in params
         assert "session_id" in params
         assert "resume" in params
+        assert "timeout" in params  # 修复 C: per-task timeout 参数
         # 同样可从顶层 utils 包导入
         assert callable(call_claude)
+
+    #
+    # --- 错误日志精度 (修复 A) ---
+    #
+
+    def test_nonzero_exit_empty_stderr_logs_returncode(self, caplog):
+        """non-zero + 空 stderr 模式 (本次 Bug 模式): 返回 None 且日志含 returncode=-15."""
+        mock_result = MagicMock()
+        mock_result.returncode = -15  # SIGTERM
+        mock_result.stderr = ""
+        mock_result.stdout = ""
+
+        with caplog.at_level(logging.ERROR, logger="mailcode.utils.claude_runner"):
+            with patch.object(subprocess, "run", return_value=mock_result):
+                result = cr_module.call_claude("test prompt")
+
+        assert result is None
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("returncode=-15" in r.getMessage() for r in error_records), \
+            f"expected returncode=-15 in ERROR log, got: {[r.getMessage() for r in error_records]}"
+        assert any("stderr[:500]=''" in r.getMessage() for r in error_records), \
+            f"expected empty stderr repr in ERROR log, got: {[r.getMessage() for r in error_records]}"
+        assert any("args=" in r.getMessage() for r in error_records)
+
+    def test_signal_kill_logged_as_negative_returncode(self, caplog):
+        """SIGKILL (returncode=-9) 应被显式区分于普通错误 (returncode=+N)."""
+        mock_result = MagicMock()
+        mock_result.returncode = -9
+        mock_result.stderr = "Killed"
+        mock_result.stdout = ""
+
+        with caplog.at_level(logging.ERROR, logger="mailcode.utils.claude_runner"):
+            with patch.object(subprocess, "run", return_value=mock_result):
+                result = cr_module.call_claude("test")
+
+        assert result is None
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("returncode=-9" in r.getMessage() for r in error_records)
+
+    #
+    # --- OSError 兜底 (修复 B) ---
+    #
+
+    def test_broken_pipe_error_returns_none(self, caplog):
+        """BrokenPipeError 应被捕获并返回 None, 不冒泡到调用方."""
+        with caplog.at_level(logging.ERROR, logger="mailcode.utils.claude_runner"):
+            with patch.object(
+                subprocess, "run",
+                side_effect=BrokenPipeError(32, "Broken pipe"),
+            ):
+                result = cr_module.call_claude("test")
+
+        assert result is None
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("errno=32" in r.getMessage() for r in error_records)
+        assert any("OS 错误" in r.getMessage() for r in error_records)
+
+    def test_permission_error_returns_none(self, caplog):
+        """PermissionError 应被捕获并返回 None."""
+        with caplog.at_level(logging.ERROR, logger="mailcode.utils.claude_runner"):
+            with patch.object(
+                subprocess, "run",
+                side_effect=PermissionError(13, "Permission denied"),
+            ):
+                result = cr_module.call_claude("test")
+
+        assert result is None
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("errno=13" in r.getMessage() for r in error_records)
+
+    #
+    # --- Per-task timeout (修复 C) ---
+    #
+
+    def test_custom_timeout_passed_to_subprocess(self):
+        """timeout 参数应传给 subprocess.run 而非默认 86400."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+
+        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
+            cr_module.call_claude("test", timeout=120)
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["timeout"] == 120
+
+    def test_default_timeout_unchanged_without_param(self):
+        """不传 timeout 时仍用 CLAUDE_TIMEOUT_SECONDS (向后兼容)."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+
+        with patch.object(subprocess, "run", return_value=mock_result) as mock_run:
+            cr_module.call_claude("test")
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["timeout"] == 86400
+
+    #
+    # --- Subprocess lifecycle 日志 (修复 D) ---
+    #
+
+    def test_lifecycle_logs_start_and_end(self, caplog):
+        """INFO 日志应包含启动 + 结束 (elapsed)."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok"
+        mock_result.stderr = ""
+
+        with caplog.at_level(logging.INFO, logger="mailcode.utils.claude_runner"):
+            with patch.object(subprocess, "run", return_value=mock_result):
+                cr_module.call_claude("hello world")
+
+        info_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any("claude 子进程启动" in m for m in info_messages), \
+            f"expected startup INFO log, got: {info_messages}"
+        assert any("claude 子进程成功" in m for m in info_messages), \
+            f"expected success INFO log, got: {info_messages}"
+        assert any("prompt_len=" in m for m in info_messages)
