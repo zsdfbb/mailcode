@@ -515,12 +515,25 @@ class IMAPListener:
 
             for uid_bytes in uids:
                 uid = uid_bytes.decode()
-                # 推进 watermark: 见到这个 UID 就认为"水线已至此"
+                # 记录 fetch 前的 watermark, 若 fetch 失败可回退
+                pre_fetch_watermark = self._highest_seen_uid
                 uid_int = int(uid) if uid.isdigit() else 0
                 if uid_int > self._highest_seen_uid:
                     self._highest_seen_uid = uid_int
                 status, msg_data = mail.fetch(uid_bytes, "(BODY.PEEK[])")
                 if status != "OK":
+                    continue
+                # FETCH 返回 OK 但 msg_data 为空或首项为 None:
+                # 服务器已 expunge 该 UID (SEARCH 与 FETCH 间的 TOCTOU 竞态)
+                # 或部分 IMAP 协议变体对已删除消息返回 (OK, [None])。
+                # 回退 watermark 以便下次 SEARCH 重新尝试, 不加入 processed_uids
+                # 避免误判 (若消息恢复可再次拉取)。
+                if not msg_data or msg_data[0] is None:
+                    logger.warning(
+                        f"FETCH 返回空响应, 跳过 UID={uid} "
+                        f"(可能已被服务器 expunge, watermark 已回退)"
+                    )
+                    self._highest_seen_uid = pre_fetch_watermark
                     continue
 
                 raw_email = msg_data[0][1]

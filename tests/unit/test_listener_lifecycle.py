@@ -235,6 +235,46 @@ class TestListenerLifecycle:
             assert "BODY.PEEK" in args[1], f"Expected BODY.PEEK, got {args[1]}"
             assert "RFC822" not in args[1], f"RFC822 should not be present, got {args[1]}"
 
+    def test_fetch_unread_skips_none_msg_data_without_crashing(self, mock_config_patch, caplog):
+        """fetch_unread_emails 在 FETCH 返回 None 项时跳过并继续, 不崩溃。
+
+        场景: SEARCH 返回 UID, 但 FETCH 返回 [None] —— 服务器端 UID 已被 expunge
+        (TOCTOU) 或 IMAP 协议变体 (Outlook 等)。监听器必须跳过该 UID 而不让循环退出。
+        """
+        import logging
+        caplog.set_level(logging.WARNING)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock()
+        mock_mail.select.return_value = ("OK", [b"1"])
+        mock_mail.noop.return_value = ("OK", [None])
+        # SEARCH 返回两个 UID, 但其中一个已被服务器端 expunge
+        mock_mail.uid.return_value = ("OK", [b"100 101"])
+        # 第一封: 正常; 第二封: expunged (返回 None)
+        raw = b"From: u@t.com\r\nSubject: t\r\n\r\nhi"
+        mock_mail.fetch.side_effect = [
+            ("OK", [(b"100 (BODY.PEEK[] {2}", raw)]),  # 正常
+            ("OK", [None]),                            # expunged
+        ]
+
+        with patch.object(listener, "_is_own_message", return_value=False), \
+             patch.object(listener, "_is_duplicate", return_value=False), \
+             patch("mailcode.relay.email_listener.get_auth_policy", return_value="off"), \
+             patch.object(listener.security_checker, "is_sender_allowed", return_value=True):
+            results = listener.fetch_unread_emails(dry_run=True, mail=mock_mail)
+
+        # 不崩溃, 返回正常邮件
+        assert isinstance(results, list)
+        assert len(results) == 1, f"应只拉取 1 封正常邮件, 实际 {len(results)}"
+        assert results[0]["uid"] == "100"
+        # expunged 的 UID 不应被加入 processed_uids (允许后续恢复)
+        assert "101" not in listener.processed_uids
+        # 警告日志应出现
+        assert any("101" in msg and ("None" in msg or "expung" in msg.lower() or "跳过" in msg)
+                   for msg in caplog.messages), \
+            f"Expected warning log for UID 101, got: {caplog.messages}"
+
     def test_post_reconnect_fetch_logs_accumulated_count(self, mock_config_patch, caplog):
         """R2: got_event=True 触发重连后, 首轮 fetch 拉到 N 封累积未读, 日志显式记录"""
         import logging
@@ -709,24 +749,31 @@ class TestUidWatermark:
         # watermark 应推进到 208
         assert listener._highest_seen_uid == 208
 
-    def test_fetch_returns_already_seen_emails(self, mock_config_patch):
+    def test_fetch_returns_already_seen_emails(self, mock_config_patch, tmp_path):
         """回归测试: \\Seen 邮件也能被处理 (修复 126 MailMaster 预读丢邮件 Bug)"""
-        listener = IMAPListener()
+        # 隔离: 重定向 _MAILCODE_HOME 到 tmp_path, 使 listener 读不到真实 state.json
+        import mailcode.relay.email_listener as el_mod
+        original_home = el_mod._MAILCODE_HOME
+        el_mod._MAILCODE_HOME = tmp_path
+        try:
+            listener = IMAPListener()
 
-        mock_mail = MagicMock()
-        mock_mail.select.return_value = ("OK", [b"1"])
-        mock_mail.noop.return_value = ("OK", [None])
-        # 这封邮件虽然有 \\Seen 标志, 但 UID SEARCH 1:* 仍能找到它
-        mock_mail.uid.return_value = ("OK", [b"207"])
-        raw = b"From: u@t.com\r\nSubject: fenglaiindex\r\n\r\nbody"
-        # fetch 返回的 flags 含 \\Seen
-        mock_mail.fetch.return_value = ("OK", [(b"207 (UID 207 FLAGS (\\Seen) BODY.PEEK[] {10}", raw)])
+            mock_mail = MagicMock()
+            mock_mail.select.return_value = ("OK", [b"1"])
+            mock_mail.noop.return_value = ("OK", [None])
+            # 这封邮件虽然有 \\Seen 标志, 但 UID SEARCH 1:* 仍能找到它
+            mock_mail.uid.return_value = ("OK", [b"207"])
+            raw = b"From: u@t.com\r\nSubject: fenglaiindex\r\n\r\nbody"
+            # fetch 返回的 flags 含 \\Seen
+            mock_mail.fetch.return_value = ("OK", [(b"207 (UID 207 FLAGS (\\Seen) BODY.PEEK[] {10}", raw)])
 
-        with patch.object(listener, "_is_own_message", return_value=False), \
-             patch.object(listener, "_is_duplicate", return_value=False), \
-             patch("mailcode.relay.email_listener.get_auth_policy", return_value="off"), \
-             patch.object(listener.security_checker, "is_sender_allowed", return_value=True):
-            results = listener.fetch_unread_emails(dry_run=False, mail=mock_mail)
+            with patch.object(listener, "_is_own_message", return_value=False), \
+                 patch.object(listener, "_is_duplicate", return_value=False), \
+                 patch("mailcode.relay.email_listener.get_auth_policy", return_value="off"), \
+                 patch.object(listener.security_checker, "is_sender_allowed", return_value=True):
+                results = listener.fetch_unread_emails(dry_run=False, mail=mock_mail)
+        finally:
+            el_mod._MAILCODE_HOME = original_home
 
         # 关键断言: 即使邮件是 \\Seen, 也应进入处理流程
         assert len(results) == 1, f"\\Seen 邮件必须被处理, got: {results}"
