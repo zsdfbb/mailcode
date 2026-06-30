@@ -89,6 +89,107 @@ class TestListenerLifecycle:
 
         assert any("不支持 IDLE" in msg for msg in caplog.messages)
 
+    def test_safe_logout_handles_none_and_exceptions(self, mock_config_patch):
+        """_safe_logout: None 输入不崩, logout 抛异常被吞掉"""
+        listener = IMAPListener()
+
+        # None 输入: 不崩
+        listener._safe_logout(None)
+
+        # logout 抛异常: 吞掉
+        bad_mail = MagicMock()
+        bad_mail.logout.side_effect = ConnectionResetError("server gone")
+        listener._safe_logout(bad_mail)  # 不应抛出
+
+        # 正常 logout: 调用一次
+        good_mail = MagicMock()
+        listener._safe_logout(good_mail)
+        good_mail.logout.assert_called_once()
+
+    def test_fetch_one_returns_raw_on_ok_response(self, mock_config_patch):
+        """_fetch_one: 正常 (OK, [(literal, raw)]) 返回 raw bytes"""
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        raw = b"raw email bytes"
+        mock_mail.fetch.return_value = ("OK", [(b"100 (BODY.PEEK[] {14}", raw)])
+
+        result = listener._fetch_one(mock_mail, b"100")
+
+        assert result == raw
+        mock_mail.fetch.assert_called_once_with(b"100", "(BODY.PEEK[])")
+
+    def test_fetch_one_returns_none_on_status_not_ok(self, mock_config_patch):
+        """_fetch_one: status != OK 返回 None"""
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        mock_mail.fetch.return_value = ("NO", [b"some error"])
+
+        assert listener._fetch_one(mock_mail, b"100") is None
+
+    def test_fetch_one_returns_none_on_toctou_none_response(self, mock_config_patch):
+        """_fetch_one: 服务器 expunge 后返回 (OK, [None]) → None (TOCTOU)"""
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        mock_mail.fetch.return_value = ("OK", [None])
+
+        assert listener._fetch_one(mock_mail, b"100") is None
+
+    def test_fetch_one_returns_none_on_empty_msg_data(self, mock_config_patch):
+        """_fetch_one: msg_data 为空列表也返回 None"""
+        listener = IMAPListener()
+        mock_mail = MagicMock()
+        mock_mail.fetch.return_value = ("OK", [])
+
+        assert listener._fetch_one(mock_mail, b"100") is None
+
+    def test_reconnect_and_arm_calls_select_noop_and_updates_time(self, mock_config_patch, tmp_path):
+        """_reconnect_and_arm: 集中协议不变量 (select + noop + _last_connect_time)"""
+        import mailcode.relay.email_listener as el_mod
+        original_home = el_mod._MAILCODE_HOME
+        el_mod._MAILCODE_HOME = tmp_path
+        try:
+            listener = IMAPListener()
+            listener._last_connect_time = 0.0  # 设为旧值以便验证更新
+
+            mock_mail = MagicMock()
+            mock_mail.select.return_value = ("OK", [b"1"])
+            mock_mail.noop.return_value = ("OK", [None])
+
+            with patch.object(listener, "_reconnect", return_value=mock_mail) as mock_reconnect:
+                result = listener._reconnect_and_arm()
+
+            # 返回值是 _reconnect 的结果
+            assert result is mock_mail
+            mock_reconnect.assert_called_once()
+            # 协议不变量被集中执行
+            mock_mail.select.assert_called_once_with("INBOX")
+            mock_mail.noop.assert_called_once()
+            # _last_connect_time 必须更新 (防止下一轮立刻触发预判性重连)
+            assert listener._last_connect_time > 0.0
+        finally:
+            el_mod._MAILCODE_HOME = original_home
+
+    def test_reconnect_and_arm_swallows_noop_errors(self, mock_config_patch, tmp_path):
+        """_reconnect_and_arm: noop 抛异常被吞掉, 不阻断重连"""
+        import mailcode.relay.email_listener as el_mod
+        original_home = el_mod._MAILCODE_HOME
+        el_mod._MAILCODE_HOME = tmp_path
+        try:
+            listener = IMAPListener()
+
+            mock_mail = MagicMock()
+            mock_mail.select.return_value = ("OK", [b"1"])
+            mock_mail.noop.side_effect = ConnectionResetError("server gone")
+
+            with patch.object(listener, "_reconnect", return_value=mock_mail):
+                result = listener._reconnect_and_arm()
+
+            # 不崩, 返回 mail, 时间仍更新
+            assert result is mock_mail
+            assert listener._last_connect_time > 0.0
+        finally:
+            el_mod._MAILCODE_HOME = original_home
+
     def test_listen_cleanup_on_stop(self, mock_config_patch):
         """listen() 的 finally 块执行 UID 保存"""
         listener = IMAPListener()

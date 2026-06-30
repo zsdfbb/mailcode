@@ -214,6 +214,54 @@ class IMAPListener:
                 f"IMAP 连接失败 [{host}:{port}]: {type_name}: {e}"
             )
 
+    @staticmethod
+    def _safe_logout(mail: Optional[imaplib.IMAP4]) -> None:
+        """安全 logout: 吞掉所有异常。
+
+        logout 失败是预期的常见情况 (服务器已关闭 / 协议异常 / 网络断),
+        不应影响后续流程。集中到一处防止调用方遗漏 try/except。
+        """
+        if mail is None:
+            return
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fetch_one(mail: imaplib.IMAP4, uid: bytes) -> Optional[bytes]:
+        """FETCH 单封邮件, 统一处理 status / msg_data 形状, 返回 raw bytes 或 None。
+
+        返回 None 的场景:
+        - status != "OK" (IMAP 协议错误)
+        - msg_data 为空或首项为 None (服务器已 expunge 该 UID, SEARCH 与 FETCH 间
+          的 TOCTOU 竞态; 或部分 IMAP 协议变体对已删除消息返回 (OK, [None]))
+
+        调用方负责业务状态 (如 watermark rollback / processed_uids 去重)。
+        """
+        status, msg_data = mail.fetch(uid, "(BODY.PEEK[])")
+        if status != "OK":
+            return None
+        if not msg_data or msg_data[0] is None:
+            return None
+        return msg_data[0][1]
+
+    def _reconnect_and_arm(self) -> imaplib.IMAP4_SSL:
+        """重连后 arm IDLE: select INBOX + noop 探活 + 更新 _last_connect_time。
+
+        集中"重连后必须做什么"的协议不变量, 防止调用方遗漏某一步
+        (历史上 got_event 分支曾遗漏 _last_connect_time 更新,
+        导致下一轮立刻触发预判性重连)。
+        """
+        mail = self._reconnect()
+        mail.select("INBOX")
+        try:
+            mail.noop()
+        except Exception:
+            pass
+        self._last_connect_time = time.monotonic()
+        return mail
+
     def _init_baseline(self):
         """建立启动基线：用 UID SEARCH 1:* 扫描所有邮件, 记录 watermark + UIDVALIDITY,
         把所有现有邮件加入 processed_uids 防止重处理。"""
@@ -241,7 +289,7 @@ class IMAPListener:
                     f"邮件基线已建立: {count} 封历史邮件已跳过, "
                     f"watermark={self._highest_seen_uid}, uid_validity={self._uid_validity}"
                 )
-            mail.logout()
+            self._safe_logout(mail)
         except Exception as e:
             logger.warning(f"建立邮件基线失败: {e}")
 
@@ -387,10 +435,7 @@ class IMAPListener:
 
     def _reconnect(self) -> imaplib.IMAP4_SSL:
         if self._mail is not None:
-            try:
-                self._mail.logout()
-            except Exception:
-                pass
+            self._safe_logout(self._mail)
             self._mail = None
         # 先清旧 event，让旧 idle_thread 的 while 循环看到 is_set()==False 后退出
         self._idle_ready.clear()
@@ -520,23 +565,16 @@ class IMAPListener:
                 uid_int = int(uid) if uid.isdigit() else 0
                 if uid_int > self._highest_seen_uid:
                     self._highest_seen_uid = uid_int
-                status, msg_data = mail.fetch(uid_bytes, "(BODY.PEEK[])")
-                if status != "OK":
-                    continue
-                # FETCH 返回 OK 但 msg_data 为空或首项为 None:
-                # 服务器已 expunge 该 UID (SEARCH 与 FETCH 间的 TOCTOU 竞态)
-                # 或部分 IMAP 协议变体对已删除消息返回 (OK, [None])。
-                # 回退 watermark 以便下次 SEARCH 重新尝试, 不加入 processed_uids
-                # 避免误判 (若消息恢复可再次拉取)。
-                if not msg_data or msg_data[0] is None:
+                raw_email = self._fetch_one(mail, uid_bytes)
+                if raw_email is None:
+                    # 服务器已 expunge 该 UID (TOCTOU) 或协议变体返回空响应。
+                    # 回退 watermark 以便下次 SEARCH 重试, 不加入 processed_uids。
                     logger.warning(
                         f"FETCH 返回空响应, 跳过 UID={uid} "
                         f"(可能已被服务器 expunge, watermark 已回退)"
                     )
                     self._highest_seen_uid = pre_fetch_watermark
                     continue
-
-                raw_email = msg_data[0][1]
                 msg = email.message_from_bytes(raw_email)
 
                 msg_id = msg.get("Message-ID", "") or msg.get("Message-Id", "") or uid
@@ -608,11 +646,8 @@ class IMAPListener:
             logger.exception(f"IMAP 监听未知错误: {e}")
             raise
         finally:
-            if owns_connection and mail is not None:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
+            if owns_connection:
+                self._safe_logout(mail)
 
         return results
 
@@ -958,10 +993,7 @@ class IMAPListener:
                 "如使用 163/126 等不支持 IDLE 的邮箱, 建议把 mailcode_bot.check_interval "
                 "调到 60-120s 以避免触发反滥用频率限制。"
             )
-            try:
-                mail.logout()
-            except Exception:
-                pass
+            self._safe_logout(mail)
             self._mail = None
             return self._listen_poll(dry_run, max_iterations)
 
@@ -988,12 +1020,7 @@ class IMAPListener:
                     if got_event:
                         if self._stopped.is_set():
                             break
-                        mail = self._reconnect()
-                        mail.select("INBOX")
-                        try:
-                            mail.noop()
-                        except Exception:
-                            pass
+                        mail = self._reconnect_and_arm()
                         logger.info("IDLE 收到事件, 已重连")
 
                     if self._stopped.is_set():
@@ -1014,13 +1041,7 @@ class IMAPListener:
                     # 预判性重连: QQ 邮箱约 2h 静默断连, 提前至 FORCED_RECONNECT_INTERVAL 秒主动重建
                     if not got_event and time.monotonic() - self._last_connect_time >= self.FORCED_RECONNECT_INTERVAL:
                         logger.info("预判性重连: 连接已持续 %d 秒", self.FORCED_RECONNECT_INTERVAL)
-                        mail = self._reconnect()
-                        mail.select("INBOX")
-                        try:
-                            mail.noop()
-                        except Exception:
-                            pass
-                        self._last_connect_time = time.monotonic()
+                        mail = self._reconnect_and_arm()
 
                     # 复用现有连接, 避免每轮 fetch 再开一个 (163 反滥用触发点)
                     emails = self.fetch_unread_emails(dry_run=dry_run, mail=mail)
@@ -1058,13 +1079,7 @@ class IMAPListener:
                     if self._stopped.wait(timeout=delay):
                         break
                     try:
-                        mail = self._reconnect()
-                        mail.select("INBOX")
-                        try:
-                            mail.noop()
-                        except Exception:
-                            pass
-                        self._last_connect_time = time.monotonic()
+                        mail = self._reconnect_and_arm()
                         logger.info("退避重连成功, 准备拉取累积未读")
                     except imaplib.IMAP4.error as auth_err:
                         # 重连时再认证失败 = 配置问题, 放弃
@@ -1082,11 +1097,7 @@ class IMAPListener:
                     break
         finally:
             self._active_idle_mail = None
-            if mail is not None:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
+            self._safe_logout(mail)
 
     # ============================================================
     # 运维命令支持 (mailcode state show / rebuild-baseline)
