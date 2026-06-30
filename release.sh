@@ -32,8 +32,11 @@ echo ""
 
 if [ "$NEW_VER" != "$CURRENT_VER" ]; then
     info "更新版本: ${CURRENT_VER} → ${NEW_VER}"
-    sed -i '' 's/__version__ = ".*"/__version__ = "'"${NEW_VER}"'"/' "$VERSION_FILE"
-    sed -i '' 's/^version = ".*"/version = "'"${NEW_VER}"'"/' "$PYPROJECT_FILE"
+    # POSIX 可移植写法: GNU sed (Linux) 不支持 -i '', BSD sed (macOS) 需要 -i ''
+    sed 's/__version__ = ".*"/__version__ = "'"${NEW_VER}"'"/' "$VERSION_FILE" > "${VERSION_FILE}.tmp" \
+        && mv "${VERSION_FILE}.tmp" "$VERSION_FILE"
+    sed 's/^version = ".*"/version = "'"${NEW_VER}"'"/' "$PYPROJECT_FILE" > "${PYPROJECT_FILE}.tmp" \
+        && mv "${PYPROJECT_FILE}.tmp" "$PYPROJECT_FILE"
     git add "$VERSION_FILE" "$PYPROJECT_FILE"
     git commit -m "chore: bump version to ${NEW_VER}"
     log "版本已更新并提交"
@@ -63,7 +66,7 @@ generate_release_notes() {
         local label="${type_info%%:*}"
         local prefix="${type_info##*:}"
         local commits
-        commits=$(git log "$range" --oneline --no-decorate 2>/dev/null | grep -i "^[a-f0-9]* ${prefix}:" || true)
+        commits=$(git log "$range" --oneline --no-decorate 2>/dev/null | grep -iE "^[a-f0-9]* ${prefix}([^:]*)?:" || true)
         if [ -n "$commits" ]; then
             has_content=true
             echo "### ${label}"
@@ -76,7 +79,7 @@ generate_release_notes() {
 
     # 未被上述分类覆盖的 commit
     local other
-    other=$(git log "$range" --oneline --no-decorate 2>/dev/null | grep -iv "^[a-f0-9]* \(feat\|fix\|docs\|refactor\|test\|chore\):" || true)
+    other=$(git log "$range" --oneline --no-decorate 2>/dev/null | grep -ivE "^[a-f0-9]* (feat|fix|docs|refactor|test|chore)([^:]*)?:" || true)
     if [ -n "$other" ]; then
         has_content=true
         echo "### 其他"
