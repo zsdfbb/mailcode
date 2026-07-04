@@ -62,7 +62,7 @@ generate_release_notes() {
 
     local has_content=false
 
-    for type_info in "🚀 新功能:feat:" "🐛 修复:fix:" "📖 文档:docs:" "♻️ 重构:refactor:" "🧪 测试:test:" "🔧 其他:chore:"; do
+    for type_info in "🚀 新功能:feat" "🐛 修复:fix" "📖 文档:docs" "♻️ 重构:refactor" "🧪 测试:test" "🔧 其他:chore"; do
         local label="${type_info%%:*}"
         local prefix="${type_info##*:}"
         local commits
