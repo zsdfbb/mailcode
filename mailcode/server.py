@@ -40,12 +40,12 @@ def run_serve(args):
         elif event == "claude_failed":
             print(f"[{now}] ❌ Claude 处理失败", flush=True)
         elif event == "heartbeat":
-            # 后台健康检查仍在 60s 执行, 但控制台打印降频避免刷屏
+            # 后台健康检查仍在 60s 执行, 但控制台不打印 — 仅写入日志, 避免刷屏
             import time
             t = time.monotonic()
             if t - _last_hb_print >= HB_PRINT_INTERVAL:
                 _last_hb_print = t
-                print(f"[{now}] 🔄 IDLE 心跳正常  (每 {HB_PRINT_INTERVAL}s 显示一次)", flush=True)
+                logger.info("🔄 IDLE 心跳正常  (每 %ss 记录一次)", HB_PRINT_INTERVAL)
 
     listener.on("email_received", _console_echo)
     listener.on("claude_start", _console_echo)
