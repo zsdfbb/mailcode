@@ -111,18 +111,18 @@ class TestListenerLifecycle:
         listener = IMAPListener()
         mock_mail = MagicMock()
         raw = b"raw email bytes"
-        mock_mail.fetch.return_value = ("OK", [(b"100 (BODY.PEEK[] {14}", raw)])
+        mock_mail.uid.return_value = ("OK", [(b"100 (BODY.PEEK[] {14}", raw)])
 
         result = listener._fetch_one(mock_mail, b"100")
 
         assert result == raw
-        mock_mail.fetch.assert_called_once_with(b"100", "(BODY.PEEK[])")
+        mock_mail.uid.assert_called_once_with("FETCH", b"100", "(BODY.PEEK[])")
 
     def test_fetch_one_returns_none_on_status_not_ok(self, mock_config_patch):
         """_fetch_one: status != OK 返回 None"""
         listener = IMAPListener()
         mock_mail = MagicMock()
-        mock_mail.fetch.return_value = ("NO", [b"some error"])
+        mock_mail.uid.return_value = ("NO", [b"some error"])
 
         assert listener._fetch_one(mock_mail, b"100") is None
 
@@ -130,7 +130,7 @@ class TestListenerLifecycle:
         """_fetch_one: 服务器 expunge 后返回 (OK, [None]) → None (TOCTOU)"""
         listener = IMAPListener()
         mock_mail = MagicMock()
-        mock_mail.fetch.return_value = ("OK", [None])
+        mock_mail.uid.return_value = ("OK", [None])
 
         assert listener._fetch_one(mock_mail, b"100") is None
 
@@ -138,7 +138,7 @@ class TestListenerLifecycle:
         """_fetch_one: msg_data 为空列表也返回 None"""
         listener = IMAPListener()
         mock_mail = MagicMock()
-        mock_mail.fetch.return_value = ("OK", [])
+        mock_mail.uid.return_value = ("OK", [])
 
         assert listener._fetch_one(mock_mail, b"100") is None
 
@@ -317,10 +317,12 @@ class TestListenerLifecycle:
         mock_mail = MagicMock()
         mock_mail.select.return_value = ("OK", [b"1"])
         mock_mail.noop.return_value = ("OK", [None])
-        mock_mail.uid.return_value = ("OK", [b"100"])  # UID-based 增量拉取
-        # 最小合法邮件
+        # UID-based 增量拉取: 先 SEARCH 拿到 UID 列表, 再用 UID FETCH 取正文
         raw = b"From: u@t.com\r\nSubject: test\r\n\r\nhello"
-        mock_mail.fetch.return_value = ("OK", [(b"100 (BODY.PEEK[] {5}", raw)])
+        mock_mail.uid.side_effect = [
+            ("OK", [b"100"]),                              # SEARCH UID 1:*
+            ("OK", [(b"100 (BODY.PEEK[] {5}", raw)]),      # UID FETCH 100
+        ]
 
         with patch.object(listener, "_is_own_message", return_value=False), \
              patch.object(listener, "_is_duplicate", return_value=False), \
@@ -329,12 +331,13 @@ class TestListenerLifecycle:
             results = listener.fetch_unread_emails(dry_run=True, mail=mock_mail)
         assert isinstance(results, list)  # consume unused var
 
-        # 至少一次 fetch 调用
-        assert len(mock_mail.fetch.call_args_list) >= 1
-        for call in mock_mail.fetch.call_args_list:
-            args = call.args if hasattr(call, "args") else call[0]
-            assert "BODY.PEEK" in args[1], f"Expected BODY.PEEK, got {args[1]}"
-            assert "RFC822" not in args[1], f"RFC822 should not be present, got {args[1]}"
+        # 至少一次 UID FETCH 调用 (args = ("FETCH", uid, "(BODY.PEEK[])"))
+        fetch_calls = [c for c in mock_mail.uid.call_args_list
+                       if c.args and c.args[0] == "FETCH"]
+        assert len(fetch_calls) >= 1
+        for call in fetch_calls:
+            assert "BODY.PEEK" in call.args[2], f"Expected BODY.PEEK, got {call.args[2]}"
+            assert "RFC822" not in call.args[2], f"RFC822 should not be present, got {call.args[2]}"
 
     def test_fetch_unread_skips_none_msg_data_without_crashing(self, mock_config_patch, caplog):
         """fetch_unread_emails 在 FETCH 返回 None 项时跳过并继续, 不崩溃。
@@ -351,12 +354,11 @@ class TestListenerLifecycle:
         mock_mail.select.return_value = ("OK", [b"1"])
         mock_mail.noop.return_value = ("OK", [None])
         # SEARCH 返回两个 UID, 但其中一个已被服务器端 expunge
-        mock_mail.uid.return_value = ("OK", [b"100 101"])
-        # 第一封: 正常; 第二封: expunged (返回 None)
         raw = b"From: u@t.com\r\nSubject: t\r\n\r\nhi"
-        mock_mail.fetch.side_effect = [
-            ("OK", [(b"100 (BODY.PEEK[] {2}", raw)]),  # 正常
-            ("OK", [None]),                            # expunged
+        mock_mail.uid.side_effect = [
+            ("OK", [b"100 101"]),                         # SEARCH
+            ("OK", [(b"100 (BODY.PEEK[] {2}", raw)]),     # UID FETCH 100: 正常
+            ("OK", [None]),                               # UID FETCH 101: expunged
         ]
 
         with patch.object(listener, "_is_own_message", return_value=False), \
@@ -825,10 +827,12 @@ class TestUidWatermark:
         mock_mail = MagicMock()
         mock_mail.select.return_value = ("OK", [b"1"])
         mock_mail.noop.return_value = ("OK", [None])
-        mock_mail.uid.return_value = ("OK", [b"208"])  # 只有新的一封
         # 最小合法邮件
         raw = b"From: u@t.com\r\nSubject: test\r\n\r\nhello"
-        mock_mail.fetch.return_value = ("OK", [(b"208 (BODY.PEEK[] {5}", raw)])
+        mock_mail.uid.side_effect = [
+            ("OK", [b"208"]),                              # SEARCH UID 208:*
+            ("OK", [(b"208 (BODY.PEEK[] {5}", raw)]),      # UID FETCH 208
+        ]
 
         with patch.object(listener, "_is_own_message", return_value=False), \
              patch.object(listener, "_is_duplicate", return_value=False), \
@@ -863,10 +867,12 @@ class TestUidWatermark:
             mock_mail.select.return_value = ("OK", [b"1"])
             mock_mail.noop.return_value = ("OK", [None])
             # 这封邮件虽然有 \\Seen 标志, 但 UID SEARCH 1:* 仍能找到它
-            mock_mail.uid.return_value = ("OK", [b"207"])
             raw = b"From: u@t.com\r\nSubject: fenglaiindex\r\n\r\nbody"
-            # fetch 返回的 flags 含 \\Seen
-            mock_mail.fetch.return_value = ("OK", [(b"207 (UID 207 FLAGS (\\Seen) BODY.PEEK[] {10}", raw)])
+            # UID FETCH 返回的 flags 含 \\Seen
+            mock_mail.uid.side_effect = [
+                ("OK", [b"207"]),                              # SEARCH UID 1:*
+                ("OK", [(b"207 (UID 207 FLAGS (\\Seen) BODY.PEEK[] {10}", raw)]),
+            ]
 
             with patch.object(listener, "_is_own_message", return_value=False), \
                  patch.object(listener, "_is_duplicate", return_value=False), \
@@ -934,9 +940,13 @@ class TestUidWatermark:
         mock_mail.select.return_value = ("OK", [b"1"])
         mock_mail.noop.return_value = ("OK", [None])
         # 模拟邮箱里有 200, 207, 208 三封, 但 207/208 已在 processed_uids
-        mock_mail.uid.return_value = ("OK", [b"200 207 208"])
         raw = b"From: u@t.com\r\nSubject: old\r\n\r\nbody"
-        mock_mail.fetch.return_value = ("OK", [(b"200 (BODY.PEEK[] {10}", raw)])
+        mock_mail.uid.side_effect = [
+            ("OK", [b"200 207 208"]),                    # SEARCH UID 1:*
+            ("OK", [(b"200 (BODY.PEEK[] {10}", raw)]),   # UID FETCH 200
+            ("OK", [(b"207 (BODY.PEEK[] {10}", raw)]),   # UID FETCH 207
+            ("OK", [(b"208 (BODY.PEEK[] {10}", raw)]),   # UID FETCH 208
+        ]
 
         with patch.object(listener, "_is_own_message", return_value=False), \
              patch.object(listener, "_is_duplicate", return_value=False), \

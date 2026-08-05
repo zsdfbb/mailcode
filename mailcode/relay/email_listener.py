@@ -239,7 +239,9 @@ class IMAPListener:
 
         调用方负责业务状态 (如 watermark rollback / processed_uids 去重)。
         """
-        status, msg_data = mail.fetch(uid, "(BODY.PEEK[])")
+        # 必须用 UID 口径 FETCH: SEARCH 返回的是 UID, 普通 FETCH 按消息序号取值,
+        # 当 INBOX 存在已 expunge 的 UID 空洞时序号与 UID 不再一致, 会取到空响应。
+        status, msg_data = mail.uid("FETCH", uid, "(BODY.PEEK[])")
         if status != "OK":
             return None
         if not msg_data or msg_data[0] is None:
