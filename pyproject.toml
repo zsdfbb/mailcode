@@ -20,3 +20,10 @@ mailcode = [
     "resources/*.json",
     "resources/*.js",
 ]
+
+[tool.ruff.lint]
+# 显式声明规则集, 不依赖 ruff 的浮动默认值。
+# 背景: ruff 0.16 扩大默认规则集 (FA100/UP006/DTZ/I001 等现代化规则),
+# 未锁版本导致 CI 一次性标红 254 处存量代码。此处固定为旧默认集
+# E4/E7/E9/F, 保持 lint 稳定; 如需启用现代化规则, 作为独立任务扩展。
+select = ["E4", "E7", "E9", "F"]
