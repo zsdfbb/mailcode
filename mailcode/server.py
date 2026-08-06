@@ -1,13 +1,42 @@
 """MailCode IMAP 监听服务 — 由 cli.py:cmd_serve 调用"""
 
+import os
 import sys
+import fcntl
 import signal
 import logging
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 from mailcode.relay.email_listener import IMAPListener
 
 logger = logging.getLogger("mailcode")
+
+# 常驻中继互斥锁: 多个 mailcode serve 进程共享同一 state.json, 若第二个常驻
+# 中继同时启动, 会与已有中继抢写 state.json (原子写竞态, 见 email_listener
+# ._save_state)。flock 保证同一时刻只有一个常驻中继。
+_SERVE_LOCK_PATH = Path.home() / ".config" / "mailcode" / "serve.lock"
+
+
+def acquire_serve_lock(lock_path: Optional[Path] = None) -> Optional[int]:
+    """抢占 serve.lock (flock 非阻塞), 防止第二个常驻中继启动。
+
+    返回持有锁的 fd —— 调用方必须持有引用直至进程结束 (进程退出自动释放锁);
+    已有中继在跑时返回 None。
+    --once 一次性模式不抢占, 可与常驻中继并存 (它只做单轮拉取, 不写 state.json)。
+    """
+    path = lock_path or _SERVE_LOCK_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd.write(f"{os.getpid()}\n")
+        fd.flush()
+        return fd
+    except OSError:
+        fd.close()
+        return None
 
 
 def run_serve(args):

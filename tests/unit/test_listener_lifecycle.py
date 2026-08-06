@@ -1250,3 +1250,56 @@ class TestIdleDenied:
         # _log_connection_error 应输出 IMAP 连接失败日志
         assert any("连接失败" in msg for msg in caplog.messages), \
             f"Expected connection failure log. caplog: {caplog.messages}"
+
+    def test_save_state_concurrent_writers_no_crash(self, mock_config_patch, tmp_path):
+        """并发 _save_state 不崩溃: 共享同一 state_path 时 tmp 文件名必须每 writer 唯一。
+
+        背景: 两个 mailcode serve 进程同时运行, 共享固定 state.json.tmp 的原子写
+        存在 TOCTOU 竞态——A 把 tmp rename 成 state.json 后, B 的 os.replace 因
+        tmp 已不存在而抛 FileNotFoundError, 曾导致监听器主循环异常退出。
+        修复后 tmp 名含 pid+threadid, rename 仍是原子的, 后写者胜, 不再崩溃。
+        """
+        import json as json_mod
+        import threading
+        import mailcode.relay.email_listener as el_mod
+
+        original_home = el_mod._MAILCODE_HOME
+        el_mod._MAILCODE_HOME = tmp_path
+        try:
+            listener = IMAPListener()
+        finally:
+            el_mod._MAILCODE_HOME = original_home
+
+        listener.processed_uids = {"1", "2", "3"}
+        listener.sent_messages = [{"message_id": "m1", "sent_at": "2026-08-06T00:00:00"}]
+        listener._highest_seen_uid = 42
+        listener._uid_validity = 12345
+
+        n_threads = 8
+        n_iters = 300
+        errors = []
+        barrier = threading.Barrier(n_threads)
+
+        def worker():
+            barrier.wait()  # 同时开跑, 放大竞态窗口
+            for _ in range(n_iters):
+                try:
+                    listener._save_state({
+                        "processed_uids": list(listener.processed_uids),
+                        "sent_messages": listener.sent_messages,
+                    })
+                except FileNotFoundError as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"并发 _save_state 不应抛 FileNotFoundError, 得到 {len(errors)} 个"
+
+        # 最终 state.json 必须是完整合法的 JSON (原子写未被破坏)
+        with open(listener.state_path, encoding="utf-8") as f:
+            data = json_mod.load(f)
+        assert set(data) >= {"processed_uids", "sent_messages", "highest_seen_uid", "uid_validity"}

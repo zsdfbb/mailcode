@@ -323,6 +323,64 @@ class TestServe:
         mock_listener.assert_not_called()
         mock_run.assert_not_called()
 
+    def test_acquire_serve_lock_second_writer_rejected(self):
+        """acquire_serve_lock: 首次拿到锁, 未释放时二次抢占被拒, 释放后可再拿。"""
+        import tempfile
+        from mailcode.server import acquire_serve_lock
+
+        lock_path = Path(tempfile.mkdtemp()) / "serve.lock"
+        fd1 = acquire_serve_lock(lock_path)
+        assert fd1 is not None, "首次应拿到锁"
+        try:
+            fd2 = acquire_serve_lock(lock_path)
+            assert fd2 is None, "锁未释放时二次抢占应被拒"
+        finally:
+            fd1.close()
+        fd3 = acquire_serve_lock(lock_path)
+        assert fd3 is not None, "释放后应可再拿锁"
+        fd3.close()
+
+    def test_cmd_serve_refuses_second_instance(self, mock_config_patch, capsys):
+        """已有常驻中继时, cmd_serve 打印提示并以 exit 1 拒绝启动。"""
+        from mailcode.cli import cmd_serve
+
+        class FakeArgs:
+            dry_run = True
+            once = False
+            no_idle = True
+            session = False
+
+        with patch("mailcode.config.validate_serve_config", return_value=[]), \
+             patch("mailcode.utils.logging.setup_logging") as mock_log, \
+             patch("mailcode.server.run_serve") as mock_run, \
+             patch("mailcode.server.acquire_serve_lock", return_value=None):
+            with pytest.raises(SystemExit) as exc:
+                cmd_serve(FakeArgs())
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "已有 MailCode 中继在运行" in err
+        mock_log.assert_not_called()
+        mock_run.assert_not_called()
+
+    def test_cmd_serve_once_bypasses_lock(self, mock_config_patch, capsys):
+        """--once 一次性模式不抢占 serve.lock, 可与常驻中继并存。"""
+        from mailcode.cli import cmd_serve
+
+        class FakeArgs:
+            dry_run = True
+            once = True
+            no_idle = True
+            session = False
+
+        with patch("mailcode.config.validate_serve_config", return_value=[]), \
+             patch("mailcode.utils.logging.setup_logging"), \
+             patch("mailcode.server.acquire_serve_lock") as mock_acquire, \
+             patch("mailcode.server.run_serve"):
+            cmd_serve(FakeArgs())
+
+        mock_acquire.assert_not_called()
+
 
 class TestSession:
     def test_session_subcommand_registered(self):

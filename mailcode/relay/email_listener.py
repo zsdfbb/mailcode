@@ -3,6 +3,7 @@
 import imaplib
 import email
 import json
+import os
 import random
 import re
 import socket
@@ -177,7 +178,13 @@ class IMAPListener:
         # 始终把当前 watermark + uid_validity 写入, 防止调用方遗漏
         state.setdefault("highest_seen_uid", self._highest_seen_uid)
         state.setdefault("uid_validity", self._uid_validity)
-        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        # tmp 文件名必须每 writer 唯一: 多个 mailcode serve 进程/线程共享同一
+        # state.json, 若 tmp 名固定, A 把 tmp rename 成 state.json 后, B 的
+        # os.replace 会因 tmp 已不存在而抛 FileNotFoundError (TOCTOU 竞态)。
+        # rename 本身是原子的, 并发写结果是后写者胜 (last-writer-wins)。
+        tmp_path = self.state_path.with_name(
+            f"{self.state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         tmp_path.replace(self.state_path)

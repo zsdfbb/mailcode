@@ -33,6 +33,20 @@ def cmd_serve(args):
         print("💡 建议: 运行 mailcode health 检查连通性")
         sys.exit(1)
 
+    # 单实例保护: 常驻中继互斥, 防止第二个 serve 与已有中继抢写 state.json
+    # (两个进程共享 tmp 原子写曾有 TOCTOU 竞态, 见 email_listener._save_state)。
+    # --once 一次性模式不抢占, 可与常驻中继并存。
+    # _serve_lock_fd 只用于在 cmd_serve 存活期间持有锁 fd 的引用 (进程退出自动释放锁),
+    # 不要删除 —— 否则 fd 被 GC 后锁失效, 第二个中继又能启动。
+    _serve_lock_fd = None
+    if not args.once:
+        from mailcode.server import acquire_serve_lock
+        _serve_lock_fd = acquire_serve_lock()
+        if _serve_lock_fd is None:
+            print("❌ 已有 MailCode 中继在运行 (serve.lock 被占用)", file=sys.stderr)
+            print("   如需重启, 请先停止旧进程。", file=sys.stderr)
+            sys.exit(1)
+
     from mailcode.utils.logging import setup_logging
     _log_file = get_config_path().parent / "relay.log"
     setup_logging(_log_file)
