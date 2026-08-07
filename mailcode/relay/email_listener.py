@@ -40,13 +40,21 @@ _MAILCODE_HOME = Path.home() / ".config" / "mailcode"
 # 连接级瞬时错误集合: 触发退避重连而非崩溃。
 # 包含 ssl.SSLError —— QQ/163 等在频繁重连时可能瞬时掐断 TLS 握手
 # (UNEXPECTED_EOF_WHILE_READING), 属可重试的握手失败。
+# 包含 socket.gaierror —— DNS 解析失败是网络瞬时问题, 同样应退避重试
+# (它是 OSError 子类, 但并非 ConnectionError/EOFError 等, 需显式列出)。
 _TRANSIENT_CONNECTION_ERRORS = (
     ConnectionError,
     EOFError,
     socket.timeout,
+    socket.gaierror,
     imaplib.IMAP4.abort,
     ssl.SSLError,
 )
+
+# IMAP 连接/TLS 握手超时 (秒)。服务器接受 TCP 但握手卡住时, 不传超时会
+# 让 _connect 无限阻塞 —— serve 挂死比崩溃更难发现 (信号也无法打断)。
+# socket.timeout 在 _TRANSIENT_CONNECTION_ERRORS 中, 超时后自动退避重试。
+_CONNECT_TIMEOUT = 15
 
 
 class _Backoff:
@@ -361,8 +369,8 @@ class IMAPListener:
         password = self.imap_config.get("pass", "")
 
         try:
-            mail = imaplib.IMAP4_SSL(host, port)
-            mail.sock.settimeout(15)
+            mail = imaplib.IMAP4_SSL(host, port, timeout=_CONNECT_TIMEOUT)
+            mail.sock.settimeout(_CONNECT_TIMEOUT)
             # 部分邮件服务商（如网易）要求在登录前发送 ID 指令
             try:
                 mail._simple_command("ID", '("name" "mailcode" "vendor" "mailcode" "support-email" "' + user + '")')

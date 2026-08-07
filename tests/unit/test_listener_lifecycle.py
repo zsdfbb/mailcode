@@ -686,6 +686,48 @@ class TestListenerLifecycle:
         assert any("连接失败" in msg for msg in caplog.messages), \
             f"Expected connection failure log. caplog: {caplog.messages}"
 
+    def test_connect_passes_timeout_to_ssl_constructor(self, mock_config_patch):
+        """IMAP4_SSL 构造必须传 timeout: 否则服务器接受 TCP 但 TLS 握手卡住时,
+        _connect 无限阻塞, serve 挂死 (信号也无法打断), 比崩溃更难发现。"""
+        listener = IMAPListener()
+
+        mock_mail = MagicMock()
+        with patch("mailcode.relay.email_listener.imaplib.IMAP4_SSL",
+                   return_value=mock_mail) as MockSSL:
+            listener._connect()
+
+        kwargs = MockSSL.call_args.kwargs
+        assert kwargs.get("timeout") is not None, \
+            f"IMAP4_SSL 应传 timeout 防止握手无限阻塞, 实际 kwargs={kwargs}"
+
+    def test_listen_poll_backoff_on_gaierror(self, mock_config_patch, caplog):
+        """_listen_poll: DNS 解析失败 (socket.gaierror) 触发退避, 不崩溃。
+
+        gaierror 是 OSError 子类但不在 (ConnectionError, EOFError, socket.timeout,
+        IMAP4.abort) 元组内, 若不显式纳入瞬时错误集合, poll 路径会被它打崩。
+        """
+        import logging
+        import socket
+        caplog.set_level(logging.ERROR)
+
+        listener = IMAPListener()
+        call_count = [0]
+
+        def fake_fetch(**kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise socket.gaierror("[Errno -3] Temporary failure in name resolution")
+            return []
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "fetch_unread_emails", side_effect=fake_fetch):
+            listener._listen_poll(dry_run=False, max_iterations=2)
+
+        assert call_count[0] == 2, f"第二轮 fetch 应成功, 实际 {call_count[0]} 次"
+        assert any("连接失败" in msg for msg in caplog.messages), \
+            f"Expected connection error log. caplog: {caplog.messages}"
+
     def test_noop_after_reconnect_select(self, mock_config_patch):
         """Fix 4: _listen_idle 的 got_event 重连后执行 NOOP。"""
         listener = IMAPListener()
