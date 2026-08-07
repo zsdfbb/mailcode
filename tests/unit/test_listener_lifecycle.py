@@ -601,6 +601,91 @@ class TestListenerLifecycle:
         assert any("网络错误" in msg for msg in caplog.messages), \
             f"Expected network error log. caplog: {caplog.messages}"
 
+    def test_proactive_reconnect_ssl_eof_backs_off_not_crash(self, mock_config_patch, caplog):
+        """回归: 预判性重连时 ssl.SSLEOFError 不崩溃进程, 退避后重试。
+
+        背景: 2026-08-07 serve 崩溃。22:19:35 预判性重连 (_reconnect_and_arm) 时
+        QQ 服务器在 TLS 握手阶段直接 EOF (UNEXPECTED_EOF_WHILE_READING)。
+        _listen_idle 的瞬时错误元组不含 ssl.SSLError, SSLEOFError 冒泡导致
+        监听器主循环异常退出, serve 进程死亡。修复后此类握手瞬时失败应退避重连。
+        """
+        import logging
+        import ssl
+        caplog.set_level(logging.ERROR)
+
+        listener = IMAPListener()
+        listener.FORCED_RECONNECT_INTERVAL = 0  # 立即触发预判性重连
+        listener._last_connect_time = 0
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        # 第一次预判性重连的 _reconnect 抛 SSLEOFError (QQ 瞬时断连), 后续成功
+        reconnect_calls = [0]
+        def fake_reconnect():
+            reconnect_calls[0] += 1
+            if reconnect_calls[0] == 1:
+                raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+            return mock_mail
+
+        wait_calls = [0]
+        def fake_wait_for_idle(mail):
+            wait_calls[0] += 1
+            if wait_calls[0] >= 3:
+                listener._stopped.set()
+            return False
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_connect", return_value=mock_mail), \
+             patch.object(listener, "_wait_for_idle", side_effect=fake_wait_for_idle), \
+             patch.object(listener, "_reconnect", side_effect=fake_reconnect), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            # 不应抛出异常 (SSLEOFError 被当瞬时错误处理)
+            listener._listen_idle(dry_run=False, max_iterations=None)
+
+        assert reconnect_calls[0] >= 2, \
+            f"SSLEOFError 后应退避重试, 实际重连 {reconnect_calls[0]} 次"
+        assert any("连接失败" in msg for msg in caplog.messages), \
+            f"Expected connection failure log. caplog: {caplog.messages}"
+
+    def test_initial_connect_ssl_eof_retries_not_crash(self, mock_config_patch, caplog):
+        """回归: serve 启动时初始连接抛 ssl.SSLEOFError 也应退避重试, 不崩溃进程。
+
+        与预判性重连崩溃同根因 (QQ 瞬时 TLS 断连)。修复后行 990 的初始连接
+        (_connect + select) 同样纳入退避, 避免限流期重启 serve 时再次崩溃。
+        """
+        import logging
+        import ssl
+        caplog.set_level(logging.ERROR)
+
+        listener = IMAPListener()
+
+        mock_mail = MagicMock(spec=["capabilities", "select", "logout", "noop", "idle_done"])
+        mock_mail.capabilities = ("IMAP4rev1", "IDLE")
+        mock_mail.select.return_value = ("OK", [b"1"])
+
+        connect_calls = [0]
+        def fake_connect():
+            connect_calls[0] += 1
+            if connect_calls[0] == 1:
+                raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+            return mock_mail
+
+        with patch.object(listener, "_init_baseline"), \
+             patch.object(listener, "_save_state"), \
+             patch.object(listener, "_prune_old_sent_messages"), \
+             patch.object(listener, "_connect", side_effect=fake_connect), \
+             patch.object(listener, "_wait_for_idle", return_value=False), \
+             patch.object(listener, "fetch_unread_emails", return_value=[]):
+            listener._listen_idle(dry_run=False, max_iterations=1)  # 不应抛异常
+
+        assert connect_calls[0] >= 2, \
+            f"初始连接失败后应退避重试, 实际 {connect_calls[0]} 次"
+        assert any("连接失败" in msg for msg in caplog.messages), \
+            f"Expected connection failure log. caplog: {caplog.messages}"
+
     def test_noop_after_reconnect_select(self, mock_config_patch):
         """Fix 4: _listen_idle 的 got_event 重连后执行 NOOP。"""
         listener = IMAPListener()

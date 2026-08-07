@@ -7,6 +7,7 @@ import os
 import random
 import re
 import socket
+import ssl
 import sys
 import time
 import threading
@@ -35,6 +36,17 @@ imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
 _NEW_IDLE_API: bool = not hasattr(imaplib.IMAP4, "idle_response")
 
 _MAILCODE_HOME = Path.home() / ".config" / "mailcode"
+
+# 连接级瞬时错误集合: 触发退避重连而非崩溃。
+# 包含 ssl.SSLError —— QQ/163 等在频繁重连时可能瞬时掐断 TLS 握手
+# (UNEXPECTED_EOF_WHILE_READING), 属可重试的握手失败。
+_TRANSIENT_CONNECTION_ERRORS = (
+    ConnectionError,
+    EOFError,
+    socket.timeout,
+    imaplib.IMAP4.abort,
+    ssl.SSLError,
+)
 
 
 class _Backoff:
@@ -432,7 +444,7 @@ class IMAPListener:
                 for _typ, _data in idler:
                     return True
             return False
-        except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort):
+        except _TRANSIENT_CONNECTION_ERRORS:
             raise
         except imaplib.IMAP4.error:
             # 服务器拒绝 IDLE 指令（如 "System busy!"）是瞬时错误,
@@ -964,7 +976,7 @@ class IMAPListener:
 
                 backoff.reset()
 
-            except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
+            except _TRANSIENT_CONNECTION_ERRORS as e:
                 delay = backoff.next_delay()
                 self._log_connection_error(e, attempt=backoff._n, next_delay=delay)
                 if self._stopped.wait(timeout=delay):
@@ -987,8 +999,19 @@ class IMAPListener:
             "processed_uids": list(self.processed_uids),
             "sent_messages": self.sent_messages,
         })
-        mail = self._connect()
-        mail.select("INBOX")
+        # 初始连接同样纳入退避: QQ 在刚断开后立刻重连可能瞬时掐断 TLS 握手
+        # (UNEXPECTED_EOF_WHILE_READING), 不能让 serve 进程因此崩溃。
+        backoff = _Backoff()
+        while True:
+            try:
+                mail = self._connect()
+                mail.select("INBOX")
+                break
+            except _TRANSIENT_CONNECTION_ERRORS as e:
+                delay = backoff.next_delay()
+                self._log_connection_error(e, attempt=backoff._n, next_delay=delay)
+                if self._stopped.wait(timeout=delay):
+                    return
 
         # 检测服务器是否支持 IMAP IDLE
         capabilities = getattr(mail, 'capabilities', None) or ()
@@ -1043,7 +1066,7 @@ class IMAPListener:
                         try:
                             mail.noop()
                             self._emit("heartbeat")
-                        except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
+                        except _TRANSIENT_CONNECTION_ERRORS as e:
                             logger.warning(f"IDLE 健康检查失败 ({type(e).__name__}), 触发重连")
                             raise
 
@@ -1080,7 +1103,7 @@ class IMAPListener:
 
                     backoff.reset()  # 一轮成功, 退避归零
 
-                except (ConnectionError, EOFError, socket.timeout, imaplib.IMAP4.abort) as e:
+                except _TRANSIENT_CONNECTION_ERRORS as e:
                     # 瞬时错误: 退避后重连
                     self._active_idle_mail = None
                     delay = backoff.next_delay()
