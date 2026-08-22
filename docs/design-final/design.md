@@ -697,7 +697,7 @@ mailcode serve 进程
 └── Scheduler 线程               ← 新增: 定时任务
     ├── 每 30s tick 扫一次 schedules.json
     ├── ScheduleStore.RLock → tmp+replace 原子写
-    ├── 到期 → call_claude(prompt, cwd)
+    ├── 到期 → call_claude_ex(prompt, cwd)   (瞬态失败按 schedule.retry_max 重试)
     └── 完成 → EmailChannel.send_reply(to_email, subject, body)
 ```
 
@@ -706,6 +706,8 @@ mailcode serve 进程
 - `--dry-run` 透传, 调度照常但不发邮件
 - Scheduler 与 IMAPListener 共享 `EmailChannel` 单例
 - signal_handler 同步停两个线程, finally 中 join(timeout=10) 兜底
+- claude 调用失败: 只对瞬态失败 (非零退出码 / OS 错误) 重试,
+  `retry_max` / `retry_backoff_seconds` 配置, 重试期间不发错误邮件
 
 ### 11.2 调度类型 (4 种)
 
@@ -744,7 +746,8 @@ mailcode serve 进程
 |------|---------|------|
 | 错过触发 | skip | 启动时重算 next_run_at; 补跑用 run-now |
 | 任务堆积 | max_concurrent=1, running flag | 串行, 到期的跳过 |
+| 瞬态失败 | retry_max=1 短延迟重试 | 仅非零退出码/OS 错误, 超时与未安装不重试 |
 | 时区 | 本地时间 + ISO8601 带 offset | 与现有风格一致 |
 | 与 session 隔离 | 不写 session | 一次邮件, 不走 IMAP 路由 |
-| call_claude 超时 | 300s | 不暴露 per-task timeout |
+| call_claude 超时 | default_timeout_seconds=1800 | 单任务可用 Task.timeout_seconds 覆盖 |
 | 文件损坏 | 启动 warn + 空任务 | 不静默修复 |

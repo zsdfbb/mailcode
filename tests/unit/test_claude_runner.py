@@ -17,7 +17,12 @@ from unittest.mock import MagicMock, patch
 
 
 from mailcode.utils import claude_runner as cr_module
-from mailcode.utils.claude_runner import call_claude
+from mailcode.utils.claude_runner import (
+    ClaudeErrorKind,
+    ClaudeResult,
+    call_claude,
+    call_claude_ex,
+)
 
 
 class TestCallClaude:
@@ -338,3 +343,88 @@ class TestCallClaude:
         assert any("claude 子进程成功" in m for m in info_messages), \
             f"expected success INFO log, got: {info_messages}"
         assert any("prompt_len=" in m for m in info_messages)
+
+
+#
+# --- call_claude_ex: 结构化失败信息 (供 Scheduler 重试用) ---
+#
+
+
+class TestCallClaudeEx:
+    """``call_claude_ex`` 契约: 失败不再压扁成 None, 而是带 kind/error。"""
+
+    def _ok_result(self, stdout: str, returncode: int = 0, stderr: str = ""):
+        mock_result = MagicMock()
+        mock_result.returncode = returncode
+        mock_result.stdout = stdout
+        mock_result.stderr = stderr
+        return mock_result
+
+    def test_success_ok_true_output(self):
+        with patch.object(subprocess, "run", return_value=self._ok_result("  x  \n")):
+            result = call_claude_ex("hi")
+
+        assert result.ok is True
+        assert result.output == "x"
+        assert result.kind is None
+        assert result.error is None
+
+    def test_success_empty_stdout_still_ok(self):
+        """成功但空 stdout (returncode=0) → ok=True, output=\"\"。"""
+        with patch.object(subprocess, "run", return_value=self._ok_result("")):
+            result = call_claude_ex("hi")
+
+        assert result.ok is True
+        assert result.output == ""
+
+    def test_nonzero_exit_kind_and_detail(self):
+        """非零退出 → kind=NONZERO_EXIT, error 含 stdout 详情 (不再丢失真实原因)。"""
+        out = "API Error: Stream error: error decoding response body\n"
+        with patch.object(subprocess, "run", return_value=self._ok_result(out, returncode=1)):
+            result = call_claude_ex("hi")
+
+        assert result.ok is False
+        assert result.output is None
+        assert result.kind == ClaudeErrorKind.NONZERO_EXIT
+        assert result.exit_code == 1
+        assert "returncode=1" in result.error
+        assert "API Error: Stream error" in result.error
+        assert "Stream error" in result.stdout_tail
+
+    def test_timeout_kind(self):
+        with patch.object(
+            subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=100),
+        ):
+            result = call_claude_ex("hi")
+        assert result.ok is False
+        assert result.kind == ClaudeErrorKind.TIMEOUT
+        assert "超时" in result.error
+
+    def test_file_not_found_kind(self):
+        with patch.object(subprocess, "run", side_effect=FileNotFoundError()):
+            result = call_claude_ex("hi")
+        assert result.ok is False
+        assert result.kind == ClaudeErrorKind.NOT_FOUND
+        assert "未找到" in result.error
+
+    def test_os_error_kind(self):
+        with patch.object(subprocess, "run", side_effect=BrokenPipeError(32, "Broken pipe")):
+            result = call_claude_ex("hi")
+        assert result.ok is False
+        assert result.kind == ClaudeErrorKind.OS_ERROR
+        assert "OS 错误" in result.error
+        assert "errno=32" in result.error
+
+    def test_call_claude_still_returns_none_on_failure(self):
+        """向后兼容: 简单版 call_claude 仍失败返回 None, 成功返回字符串。"""
+        with patch.object(subprocess, "run", return_value=self._ok_result("", returncode=1)):
+            assert cr_module.call_claude("hi") is None
+        with patch.object(subprocess, "run", return_value=self._ok_result("ok")):
+            assert cr_module.call_claude("hi") == "ok"
+
+    def test_result_truthiness_documented(self):
+        """ClaudeResult 未实现 __bool__, bool() 恒为 True — 调用方必须显式判断 .ok。"""
+        fail = ClaudeResult(ok=False, kind=ClaudeErrorKind.TIMEOUT)
+        assert bool(fail) is True  # 容易踩坑: 别用 `if result:` 判断成败
+        assert fail.ok is False

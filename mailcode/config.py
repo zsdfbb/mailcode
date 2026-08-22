@@ -205,6 +205,8 @@ SCHEDULE_DEFAULTS = {
     "max_concurrent": 1,
     "missed_run_policy": "skip",  # v1 仅支持 skip, v2 加 run_immediately
     "default_timeout_seconds": 1800,  # 子任务 claude 子进程默认超时 (30 分钟)
+    "retry_max": 1,  # claude 调用瞬态失败的最大重试次数 (0=不重试)
+    "retry_backoff_seconds": 60,  # 两次重试之间的等待秒数 (0=不等待)
 }
 
 
@@ -270,6 +272,12 @@ def validate_serve_config() -> list[str]:
             max_c = schedule_cfg.get("max_concurrent", 1)
             if not isinstance(max_c, int) or max_c < 1:
                 errors.append(f"schedule.max_concurrent 应为 >=1 整数, 当前: {max_c}")
+            retry_max = schedule_cfg.get("retry_max", 1)
+            if not isinstance(retry_max, int) or retry_max < 0:
+                errors.append(f"schedule.retry_max 应为 >=0 整数, 当前: {retry_max}")
+            retry_backoff = schedule_cfg.get("retry_backoff_seconds", 60)
+            if not isinstance(retry_backoff, int) or retry_backoff < 0:
+                errors.append(f"schedule.retry_backoff_seconds 应为 >=0 整数, 当前: {retry_backoff}")
     except Exception as e:
         logger.warning(f"配置校验过程中出错: {e}")
         errors.append(f"配置校验失败: {e}")

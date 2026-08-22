@@ -22,11 +22,23 @@ from mailcode.relay.scheduler import (
     compute_next_run,
     parse_schedule,
 )
+from mailcode.utils.claude_runner import ClaudeErrorKind, ClaudeResult
 
 
 # ------------------------------------------------------------------ #
 # Fixtures
 # ------------------------------------------------------------------ #
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_by_default():
+    """默认关闭重试, 保持无关测试快速/确定性; 重试专项测试自行覆盖。"""
+    with patch.object(
+        sched_module,
+        "get_schedule_config",
+        return_value={"retry_max": 0, "retry_backoff_seconds": 0},
+    ):
+        yield
 
 
 @pytest.fixture
@@ -355,7 +367,10 @@ class TestSchedulerLifecycle:
         assert not sched.is_alive()
 
     def test_trigger_now_同步等结果(self, store, mock_email_channel, sample_task):
-        with patch.object(sched_module, "call_claude", return_value="hello"):
+        with patch.object(
+            sched_module, "call_claude_ex",
+            return_value=ClaudeResult(ok=True, output="hello"),
+        ):
             store.add(sample_task(name="trigger-me"))
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             # 不需要 start() — trigger_now 是同步方法
@@ -364,7 +379,7 @@ class TestSchedulerLifecycle:
             assert updated.last_status == STATUS_SUCCESS
             # Claude 被调一次, 邮件发一次
             assert mock_email_channel.send_reply.call_count == 1
-            assert sched_module.call_claude.call_count == 1
+            assert sched_module.call_claude_ex.call_count == 1
 
     def test_trigger_now_找不到任务_返回_None(
         self, store, mock_email_channel
@@ -395,7 +410,8 @@ class TestTrigger:
         store.add(task)
 
         with patch.object(
-            sched_module, "call_claude", return_value="claude output"
+            sched_module, "call_claude_ex",
+            return_value=ClaudeResult(ok=True, output="claude output"),
         ) as mock_claude:
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             fixed_now = self._now_aware()
@@ -419,7 +435,10 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        with patch.object(sched_module, "call_claude", return_value="x") as mock_claude:
+        with patch.object(
+            sched_module, "call_claude_ex",
+            return_value=ClaudeResult(ok=True, output="x"),
+        ) as mock_claude:
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = self._now_aware()
@@ -428,16 +447,23 @@ class TestTrigger:
         mock_claude.assert_not_called()
         mock_email_channel.send_reply.assert_not_called()
 
-    def test_call_claude_返回_None_last_status_failed(
+    def test_call_claude_失败_写入真实详情(
         self, store, mock_email_channel, sample_task
     ):
+        """claude 失败 → last_status=failed, 且 last_error 含真实原因 (不再是笼统"返回 None")。"""
         current = self._now_aware()
         task = sample_task(name="claude-fail")
         past = current - timedelta(hours=1)
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        with patch.object(sched_module, "call_claude", return_value=None):
+        fail = ClaudeResult(
+            ok=False,
+            kind=ClaudeErrorKind.NONZERO_EXIT,
+            exit_code=1,
+            error="claude 子进程失败 returncode=1: API Error: Stream error: error decoding response body",
+        )
+        with patch.object(sched_module, "call_claude_ex", return_value=fail):
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = current
@@ -445,8 +471,92 @@ class TestTrigger:
 
         t = store.get("claude-fail")
         assert t.last_status == STATUS_FAILED
-        assert t.last_error  # 非空
-        assert "None" in t.last_error
+        assert t.last_error
+        assert "Stream error" in t.last_error
+        assert "返回 None" not in t.last_error
+        # 失败 → 发一封错误通知邮件, 正文带真实原因
+        assert mock_email_channel.send_reply.call_count == 1
+        email_body = mock_email_channel.send_reply.call_args.kwargs["body"]
+        assert "Stream error" in email_body
+        # last_run_at 记录的是实际执行时间 (tick 时刻), 而非派发时刻也非空
+        assert t.last_run_at is not None
+
+    def test_瞬态失败_重试后成功(self, store, mock_email_channel, sample_task):
+        """瞬态失败 (非零退出码) → 按 retry_max 重试 → 第二次成功 → SUCCESS。"""
+        current = self._now_aware()
+        task = sample_task(name="retry-ok")
+        past = current - timedelta(hours=1)
+        task.next_run_at = sched_module._format_dt(past)
+        store.add(task)
+
+        fail = ClaudeResult(ok=False, kind=ClaudeErrorKind.NONZERO_EXIT, exit_code=1, error="boom")
+        with patch.object(
+            sched_module, "get_schedule_config",
+            return_value={"retry_max": 1, "retry_backoff_seconds": 0},
+        ), patch.object(
+            sched_module, "call_claude_ex",
+            side_effect=[fail, ClaudeResult(ok=True, output="recovered")],
+        ) as mc:
+            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+            with patch.object(sched_module, "_now_local") as mock_now:
+                mock_now.return_value = current
+                sched._tick()
+
+        assert mc.call_count == 2
+        t = store.get("retry-ok")
+        assert t.last_status == STATUS_SUCCESS
+        # 成功只发一封结果邮件 (重试期间不发错误邮件)
+        assert mock_email_channel.send_reply.call_count == 1
+        assert mock_email_channel.send_reply.call_args.kwargs["body"] == "recovered"
+
+    def test_瞬态失败_耗尽重试_判失败(self, store, mock_email_channel, sample_task):
+        """瞬态失败持续存在 → 耗尽 retry_max 后判失败, 错误邮件带"重试 N 次"。"""
+        current = self._now_aware()
+        task = sample_task(name="retry-exhausted")
+        past = current - timedelta(hours=1)
+        task.next_run_at = sched_module._format_dt(past)
+        store.add(task)
+
+        fail = ClaudeResult(ok=False, kind=ClaudeErrorKind.NONZERO_EXIT, exit_code=1, error="boom")
+        with patch.object(
+            sched_module, "get_schedule_config",
+            return_value={"retry_max": 1, "retry_backoff_seconds": 0},
+        ), patch.object(sched_module, "call_claude_ex", return_value=fail) as mc:
+            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+            with patch.object(sched_module, "_now_local") as mock_now:
+                mock_now.return_value = current
+                sched._tick()
+
+        # retry_max=1 → 首次 + 1 次重试, 共 2 次
+        assert mc.call_count == 2
+        t = store.get("retry-exhausted")
+        assert t.last_status == STATUS_FAILED
+        assert "重试 1 次后仍失败" in t.last_error
+        # 最终失败才发一封错误邮件
+        assert mock_email_channel.send_reply.call_count == 1
+
+    def test_非瞬态失败则不重试(self, store, mock_email_channel, sample_task):
+        """timeout / not_found 是确定性失败, 即使 retry_max 很大也不重试。"""
+        current = self._now_aware()
+        task = sample_task(name="no-retry-timeout")
+        past = current - timedelta(hours=1)
+        task.next_run_at = sched_module._format_dt(past)
+        store.add(task)
+
+        fail = ClaudeResult(ok=False, kind=ClaudeErrorKind.TIMEOUT, error="claude 子进程超时 (>1800s)")
+        with patch.object(
+            sched_module, "get_schedule_config",
+            return_value={"retry_max": 5, "retry_backoff_seconds": 0},
+        ), patch.object(sched_module, "call_claude_ex", return_value=fail) as mc:
+            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+            with patch.object(sched_module, "_now_local") as mock_now:
+                mock_now.return_value = current
+                sched._tick()
+
+        assert mc.call_count == 1
+        t = store.get("no-retry-timeout")
+        assert t.last_status == STATUS_FAILED
+        assert "超时" in t.last_error
 
     def test_dry_run_True_调_call_claude_不发邮件(
         self, store, mock_email_channel, sample_task
@@ -461,7 +571,7 @@ class TestTrigger:
         sched = Scheduler(
             mock_email_channel, store, dry_run=True, tick_seconds=60
         )
-        with patch.object(sched_module, "call_claude") as mock_claude:
+        with patch.object(sched_module, "call_claude_ex") as mock_claude:
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = current
                 sched._tick()
@@ -484,7 +594,10 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        with patch.object(sched_module, "call_claude", return_value="out"):
+        with patch.object(
+            sched_module, "call_claude_ex",
+            return_value=ClaudeResult(ok=True, output="out"),
+        ):
             sched = Scheduler(channel, store, tick_seconds=60)
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = current

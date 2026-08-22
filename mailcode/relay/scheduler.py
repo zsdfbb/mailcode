@@ -20,6 +20,13 @@ MailCode 本身是 "dumb pipe" (见 ``docs/design-final/design.md`` §34-56):
 - 补跑请用 ``mailcode schedule run-now <name>`` 显式触发, 用户有显式
   控制权, 避免邮件风暴。
 
+**失败重试 (瞬态失败)**
+- claude 调用失败时, 只对**瞬态失败** (`nonzero_exit` 子进程非零退出 /
+  `os_error` OS 层错误, 通常是上游 API 类错误) 做有限重试, 由
+  ``schedule.retry_max`` / ``schedule.retry_backoff_seconds`` 配置。
+- **不重试** ``timeout`` (已吃满超时) 和 ``not_found`` (claude 未安装)。
+- 重试期间不发错误邮件, 只在最终失败时发一封带真实原因的。
+
 **线程模型**
 - 单进程多线程, ``ScheduleStore`` 用模块级 ``threading.Lock`` 保护
   JSON 读写, 锁粒度够细 (仅 JSON 文件操作)。
@@ -40,7 +47,11 @@ from pathlib import Path
 from typing import Optional
 
 from mailcode.config import get_schedule_config
-from mailcode.utils.claude_runner import call_claude
+from mailcode.utils.claude_runner import (
+    ClaudeErrorKind,
+    ClaudeResult,
+    call_claude_ex,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +90,26 @@ STATUS_FAILED = "failed"
 STATUS_DRY_RUN = "dry_run"
 
 VALID_STATUSES = {STATUS_SUCCESS, STATUS_FAILED, STATUS_DRY_RUN}
+
+# claude 调用失败后的瞬态重试上限 (默认) — 可被 schedule 配置覆盖
+DEFAULT_RETRY_MAX = 1
+DEFAULT_RETRY_BACKOFF_SECONDS = 60
+
+# 可重试的失败类别: 上游 API 错误 (非零退出码) / OS 层瞬时错误。
+# 不重试: 超时 (已吃满超时, 重试只是翻倍耗时) 和 claude 未安装 (装了才能好)。
+RETRYABLE_KINDS = {
+    ClaudeErrorKind.NONZERO_EXIT,
+    ClaudeErrorKind.OS_ERROR,
+}
+
+
+def _should_retry(result: ClaudeResult) -> bool:
+    """判断是否是值得重试的瞬态失败。
+
+    只有 ``kind ∈ RETRYABLE_KINDS`` 的失败才重试; 超时/未安装等
+    确定性失败直接判死, 不浪费下一轮超时。
+    """
+    return (not result.ok) and result.kind in RETRYABLE_KINDS
 
 
 # ------------------------------------------------------------------ #
@@ -678,9 +709,9 @@ class Scheduler(threading.Thread):
             if next_dt is None:
                 continue
             if now >= next_dt:
-                self._dispatch(task, now)
+                self._dispatch(task)
 
-    def _dispatch(self, task: Task, now: datetime) -> None:
+    def _dispatch(self, task: Task) -> None:
         """决定是否触发: 如果该 task_id 正在执行, 跳过 (running flag 保护)。"""
         with self._running_lock:
             if task.id in self._running_task_ids:
@@ -690,13 +721,17 @@ class Scheduler(threading.Thread):
                 return
             self._running_task_ids.add(task.id)
         try:
-            self._run_task(task, now)
+            self._run_task(task)
         finally:
             with self._running_lock:
                 self._running_task_ids.discard(task.id)
 
-    def _run_task(self, task: Task, now: datetime) -> tuple[bool, Optional[str]]:
-        """实际执行一个任务: 调 Claude + 发邮件 + 写回 last_* 字段。
+    def _run_task(self, task: Task) -> tuple[bool, Optional[str]]:
+        """实际执行一个任务: 调 Claude (瞬态失败可重试) + 发邮件 + 写回 last_* 字段。
+
+        - 只对瞬态失败 (``RETRYABLE_KINDS``) 重试, 由 schedule 配置控制次数
+        - 重试期间的失败不写 last_* / 不发错误邮件, 只在最终失败时记一次
+        - ``last_run_at`` / ``next_run_at`` 以实际结束时间为准
 
         Returns:
             (success, error_message)
@@ -711,58 +746,82 @@ class Scheduler(threading.Thread):
                 f"to={task.to_email}\n"
             )
             subject = f"{task.subject_prefix} {task.name} [dry-run]"
-            self.store.mark_run(task.id, STATUS_DRY_RUN, error=None, now=now)
+            self.store.mark_run(task.id, STATUS_DRY_RUN, error=None)
             # dry-run 也不发邮件, 只写 last_status
             logger.info("Scheduler dry-run: 不调 Claude, 不发邮件, id=%s", task.id)
             return True, None
 
-        # 调 Claude
         # timeout: task 自身字段优先, 否则从 config 取默认值, 最后兜底 1800s
+        cfg = get_schedule_config()
         if task.timeout_seconds is not None:
             effective_timeout = task.timeout_seconds
         else:
-            cfg = get_schedule_config()
             effective_timeout = cfg.get("default_timeout_seconds", 1800)
-        try:
-            claude_output = call_claude(task.prompt, task.cwd, timeout=effective_timeout)
-        except Exception as e:
-            err = f"call_claude 异常: {e}"
-            logger.error("Scheduler call_claude 失败 id=%s: %s", task.id, e)
-            self.store.mark_run(task.id, STATUS_FAILED, error=err, now=now)
-            self._send_error_email(task, err)
-            return False, err
+        retry_max = int(cfg.get("retry_max", DEFAULT_RETRY_MAX))
+        retry_backoff = int(cfg.get("retry_backoff_seconds", DEFAULT_RETRY_BACKOFF_SECONDS))
 
-        if claude_output is None:
-            err = "call_claude 返回 None (失败/超时/未找到)"
-            logger.error("Scheduler call_claude 返回 None id=%s", task.id)
-            self.store.mark_run(task.id, STATUS_FAILED, error=err, now=now)
-            self._send_error_email(task, err)
-            return False, err
-
-        # 拼邮件
-        body = claude_output
-        subject = f"{task.subject_prefix} {task.name}"
-        try:
-            ok, _msg_id = self.email_channel.send_reply(
-                to_email=task.to_email,
-                subject=subject,
-                body=body,
+        # ---- 调 Claude, 瞬态失败按配置重试 ---- #
+        attempt = 0
+        final: Optional[ClaudeResult] = None  # 最近一次结果 (可能成功也可能失败)
+        exc_err: Optional[str] = None         # call_claude_ex 意外抛异常时的兜底信息
+        while True:
+            attempt += 1
+            try:
+                final = call_claude_ex(task.prompt, task.cwd, timeout=effective_timeout)
+            except Exception as e:
+                # call_claude_ex 正常不抛; 防御兜底, 未知异常不重试
+                exc_err = f"call_claude 异常: {e}"
+                logger.error("Scheduler call_claude 异常 id=%s: %s", task.id, e)
+                final = None
+                break
+            if final is None:  # 理论不可达 (call_claude_ex 恒返回 ClaudeResult)
+                exc_err = "call_claude 返回 None"
+                break
+            if final.ok or attempt > retry_max or not _should_retry(final):
+                break
+            logger.info(
+                "Scheduler 重试 id=%s attempt=%d/%d (kind=%s): %s",
+                task.id, attempt, retry_max, final.kind.value, final.error,
             )
-        except Exception as e:
-            err = f"send_reply 异常: {e}"
-            logger.error("Scheduler 发邮件失败 id=%s: %s", task.id, e)
-            self.store.mark_run(task.id, STATUS_FAILED, error=err, now=now)
-            return False, err
+            # 用 Event.wait 做间隔, 停止信号可立刻打断重试
+            if retry_backoff > 0 and self._stopped.wait(timeout=retry_backoff):
+                logger.info("Scheduler 收到停止信号, 放弃重试 id=%s", task.id)
+                break
 
-        if not ok:
-            err = "send_reply 返回 False"
-            logger.error("Scheduler 发邮件失败 id=%s", task.id)
-            self.store.mark_run(task.id, STATUS_FAILED, error=err, now=now)
-            return False, err
+        finished = _now_local()  # 以实际结束时间为准写入 last_*
 
-        self.store.mark_run(task.id, STATUS_SUCCESS, error=None, now=now)
-        logger.info("Scheduler 任务完成 id=%s name=%r", task.id, task.name)
-        return True, None
+        # ---- 成功: 发结果邮件 + 记 success ---- #
+        if final is not None and final.ok:
+            body = final.output
+            subject = f"{task.subject_prefix} {task.name}"
+            try:
+                ok_send, _msg_id = self.email_channel.send_reply(
+                    to_email=task.to_email,
+                    subject=subject,
+                    body=body,
+                )
+            except Exception as e:
+                err = f"send_reply 异常: {e}"
+                logger.error("Scheduler 发邮件失败 id=%s: %s", task.id, e)
+                self.store.mark_run(task.id, STATUS_FAILED, error=err, now=finished)
+                return False, err
+            if not ok_send:
+                err = "send_reply 返回 False"
+                logger.error("Scheduler 发邮件失败 id=%s", task.id)
+                self.store.mark_run(task.id, STATUS_FAILED, error=err, now=finished)
+                return False, err
+            self.store.mark_run(task.id, STATUS_SUCCESS, error=None, now=finished)
+            logger.info("Scheduler 任务完成 id=%s name=%r", task.id, task.name)
+            return True, None
+
+        # ---- 失败 (不可重试或已耗尽重试): 记失败 + 发错误邮件 ---- #
+        err = exc_err if exc_err else (final.error if final else "call_claude 失败 (未知原因)")
+        if attempt > 1:
+            err = f"{err} (重试 {attempt - 1} 次后仍失败)"
+        logger.error("Scheduler call_claude 失败 id=%s: %s", task.id, err)
+        self.store.mark_run(task.id, STATUS_FAILED, error=err, now=finished)
+        self._send_error_email(task, err)
+        return False, err
 
     def _send_error_email(self, task: Task, err: str) -> None:
         """任务执行失败时给 to_email 发一封错误通知 (best-effort)。"""
@@ -800,7 +859,7 @@ class Scheduler(threading.Thread):
                 return task
             self._running_task_ids.add(task.id)
         try:
-            self._run_task(task, _now_local())
+            self._run_task(task)
         finally:
             with self._running_lock:
                 self._running_task_ids.discard(task.id)

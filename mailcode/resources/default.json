@@ -39,12 +39,16 @@
       "tick_seconds": "调度器主循环 tick 间隔 (秒), 30s 是 1 分钟以内精度的合理值",
       "max_concurrent": "同时执行的任务上限, 防止多个任务同时调 Claude 占满资源",
       "missed_run_policy": "错过触发处理策略, v1 仅支持 skip (不补跑)",
-      "default_timeout_seconds": "单任务 claude 子进程默认超时 (秒). 1800s 覆盖历史耗时 27s~4min 的 7.5x 余量. 单任务可用 Task.timeout_seconds 覆盖"
+      "default_timeout_seconds": "单任务 claude 子进程默认超时 (秒). 1800s 覆盖历史耗时 27s~4min 的 7.5x 余量. 单任务可用 Task.timeout_seconds 覆盖",
+      "retry_max": "claude 调用失败后的瞬态重试上限 (0=不重试). 只对瞬态失败生效 (非零退出码/OS 错误, 即上游 API 类错误); 超时和 claude 未安装不重试",
+      "retry_backoff_seconds": "两次重试之间的等待秒数 (0=不等待)"
     },
     "enabled": true,
     "tick_seconds": 30,
     "max_concurrent": 1,
     "missed_run_policy": "skip",
-    "default_timeout_seconds": 1800
+    "default_timeout_seconds": 1800,
+    "retry_max": 1,
+    "retry_backoff_seconds": 60
   }
 }
