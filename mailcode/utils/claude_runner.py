@@ -1,22 +1,32 @@
 """Claude 子进程调用器 -- 供 ConversationHandler / Scheduler 复用。
 
-抽出此模块是为了避免 scheduler 与 conversation_handler 双份实现
-``claude -p`` 调用逻辑导致行为漂移 (超时、参数、cwd 默认值等)。
+子进程调用逻辑本身在 ``mailcode.utils.agent.BaseAgentRunner`` (多 agent 共享),
+本模块只提供 Claude 专属的 argv 拼装 + 安装指引。
+
+两个模块级入口 (供邮件 handler / CLI 等直接调 Claude 的调用方使用):
+  - ``call_claude``: 简单版 — 成功返回 ``stdout.strip()``, 失败返回 ``None``。
+    契约不变。
+  - ``call_claude_ex``: 结构化版 — 返回 ``AgentResult``, 携带失败分类
+    (kind) 与真实详情 (error/stdout/stderr tail)。供 Scheduler 判断瞬态
+    失败重试、把真实原因写进 ``last_error`` 与错误邮件。
 """
 
-import logging
-import subprocess
-import time
-from pathlib import Path
 from typing import Optional
 
-from .agent import BaseAgentRunner
-
-logger = logging.getLogger(__name__)
+from .agent import (
+    DEFAULT_TIMEOUT_SECONDS,
+    AgentErrorKind,
+    AgentResult,
+    BaseAgentRunner,
+)
 
 # claude 子进程默认超时 (秒) -- 24h 兜底, 实际调用方应传更短的值
 # (Scheduler 默认 1800s, ConversationHandler 用 session.response_timeout_seconds)
-CLAUDE_TIMEOUT_SECONDS = 86400
+CLAUDE_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_SECONDS
+
+# 历史名称 (本模块对外的说法仍是 "claude 的失败分类"), 实现在 agent.py
+ClaudeErrorKind = AgentErrorKind
+ClaudeResult = AgentResult
 
 
 class ClaudeRunner(BaseAgentRunner):
@@ -44,6 +54,11 @@ class ClaudeRunner(BaseAgentRunner):
         )
 
 
+# 模块级单例 — 供下面两个函数式入口复用, 免去每次查注册表
+# (ClaudeRunner 无实例状态, which 缓存挂在类上, 共享安全)
+_claude_runner = ClaudeRunner()
+
+
 def call_claude(
     prompt: str,
     cwd: str = "",
@@ -61,56 +76,29 @@ def call_claude(
         resume: 续传已有会话 (需同时设置 session_id), 传 ``--resume`` 参数
         timeout: 子进程超时 (秒); None 表示用 ``CLAUDE_TIMEOUT_SECONDS`` (24h 兜底)
     """
-    cwd = cwd or str(Path.home())
-    args = ["claude", "--dangerously-skip-permissions"]
-    if session_id is not None:
-        args.extend(["--session-id", session_id])
-    if resume:
-        args.append("--resume")
-
-    effective_timeout = timeout if timeout is not None else CLAUDE_TIMEOUT_SECONDS
-
-    logger.info(
-        "claude 子进程启动: prompt_len=%d, timeout=%ds, cwd=%s, args=%s",
-        len(prompt), effective_timeout, cwd, args,
+    return _claude_runner.call(
+        prompt, cwd,
+        session_id=session_id, resume=resume, timeout=timeout,
     )
-    t0 = time.monotonic()
-    try:
-        result = subprocess.run(
-            args,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout,
-            cwd=cwd,
-        )
-    except subprocess.TimeoutExpired:
-        elapsed = time.monotonic() - t0
-        logger.error(
-            "claude 子进程超时 (>%ds, elapsed=%.1fs)",
-            effective_timeout, elapsed,
-        )
-        return None
-    except FileNotFoundError:
-        logger.error("claude 命令未找到, 请确保已安装 Claude Code")
-        return None
-    except OSError as e:
-        elapsed = time.monotonic() - t0
-        logger.error(
-            "claude 子进程 OS 错误: errno=%s msg=%s elapsed=%.1fs args=%s",
-            getattr(e, "errno", None), e, elapsed, args,
-        )
-        return None
 
-    elapsed = time.monotonic() - t0
-    if result.returncode != 0:
-        logger.error(
-            "claude 子进程失败: returncode=%s, elapsed=%.1fs, stderr[:500]=%r, stdout[:200]=%r, args=%s",
-            result.returncode, elapsed, result.stderr[:500], result.stdout[:200], args,
-        )
-        return None
-    logger.info(
-        "claude 子进程成功: elapsed=%.1fs, stdout_len=%d",
-        elapsed, len(result.stdout),
+
+def call_claude_ex(
+    prompt: str,
+    cwd: str = "",
+    *,
+    session_id: Optional[str] = None,
+    resume: bool = False,
+    timeout: Optional[int] = None,
+) -> AgentResult:
+    """调用 ``claude`` 子进程 (stdin 传 prompt), 返回结构化结果。
+
+    与 ``call_claude`` 的区别: 失败不再压扁成 ``None``, 而是返回带
+    ``kind``/``error`` 的 ``AgentResult``, 供调用方做瞬态重试、
+    把真实原因写入持久化状态和错误邮件。
+
+    Args / 语义同 ``call_claude``。
+    """
+    return _claude_runner.call_ex(
+        prompt, cwd,
+        session_id=session_id, resume=resume, timeout=timeout,
     )
-    return result.stdout.strip()

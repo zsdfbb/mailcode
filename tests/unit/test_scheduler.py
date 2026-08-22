@@ -22,11 +22,23 @@ from mailcode.relay.scheduler import (
     compute_next_run,
     parse_schedule,
 )
+from mailcode.utils.agent import AgentErrorKind, AgentResult
 
 
 # ------------------------------------------------------------------ #
 # Fixtures
 # ------------------------------------------------------------------ #
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_by_default():
+    """默认关闭重试, 保持无关测试快速/确定性; 重试专项测试自行覆盖。"""
+    with patch.object(
+        sched_module,
+        "get_schedule_config",
+        return_value={"retry_max": 0, "retry_backoff_seconds": 0},
+    ):
+        yield
 
 
 @pytest.fixture
@@ -35,6 +47,20 @@ def mock_email_channel():
     channel = MagicMock()
     channel.send_reply.return_value = (True, "<reply-abc@mailcode>")
     return channel
+
+
+@pytest.fixture
+def mock_runner():
+    """Mock agent runner: 默认 ``call_ex`` 成功返回 "hello"。
+
+    patch 的是 ``scheduler.get_runner`` (模块级导入的符号), 所以整条
+    "调度器 → runner.call_ex" 链路都被替换掉, 不碰真实子进程。
+    """
+    runner = MagicMock()
+    runner.name = "claude"
+    runner.call_ex.return_value = AgentResult(ok=True, output="hello")
+    with patch.object(sched_module, "get_runner", return_value=runner):
+        yield runner
 
 
 @pytest.fixture
@@ -354,19 +380,19 @@ class TestSchedulerLifecycle:
         assert sched._stopped.is_set()
         assert not sched.is_alive()
 
-    def test_trigger_now_同步等结果(self, store, mock_email_channel, sample_task):
-        mock_runner = MagicMock()
-        mock_runner.call.return_value = "hello"
-        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
-            store.add(sample_task(name="trigger-me"))
-            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
-            # 不需要 start() — trigger_now 是同步方法
-            updated = sched.trigger_now("trigger-me")
-            assert updated is not None
-            assert updated.last_status == STATUS_SUCCESS
-            # Claude 被调一次, 邮件发一次
-            assert mock_email_channel.send_reply.call_count == 1
-            assert mock_runner.call.call_count == 1
+    def test_trigger_now_同步等结果(
+        self, store, mock_email_channel, sample_task, mock_runner
+    ):
+        mock_runner.call_ex.return_value = AgentResult(ok=True, output="hello")
+        store.add(sample_task(name="trigger-me"))
+        sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+        # 不需要 start() — trigger_now 是同步方法
+        updated = sched.trigger_now("trigger-me")
+        assert updated is not None
+        assert updated.last_status == STATUS_SUCCESS
+        # AI 被调一次, 邮件发一次
+        assert mock_email_channel.send_reply.call_count == 1
+        assert mock_runner.call_ex.call_count == 1
 
     def test_trigger_now_找不到任务_返回_None(
         self, store, mock_email_channel
@@ -387,8 +413,8 @@ class TestTrigger:
         """返回带本机时区的 aware datetime, 模拟 _now_local 的实际行为。"""
         return sched_module._now_local()
 
-    def test_到点_enabled_调_call_claude_和_send_reply(
-        self, store, mock_email_channel, sample_task
+    def test_到点_enabled_调_runner_和_send_reply(
+        self, store, mock_email_channel, sample_task, mock_runner
     ):
         task = sample_task(name="tick-me")
         # 设置 next_run_at 为过去时间, 模拟已到期
@@ -396,16 +422,14 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        mock_runner = MagicMock()
-        mock_runner.call.return_value = "claude output"
-        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
-            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
-            fixed_now = self._now_aware()
-            with patch.object(sched_module, "_now_local") as mock_now:
-                mock_now.return_value = fixed_now
-                sched._tick()
+        mock_runner.call_ex.return_value = AgentResult(ok=True, output="claude output")
+        sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+        fixed_now = self._now_aware()
+        with patch.object(sched_module, "_now_local") as mock_now:
+            mock_now.return_value = fixed_now
+            sched._tick()
 
-        assert mock_runner.call.call_count == 1
+        assert mock_runner.call_ex.call_count == 1
         assert mock_email_channel.send_reply.call_count == 1
         # 验证 task 状态被更新
         t = store.get("tick-me")
@@ -414,49 +438,166 @@ class TestTrigger:
         assert t.next_run_at is not None
 
     def test_enabled_False_不触发(
-        self, store, mock_email_channel, sample_task
+        self, store, mock_email_channel, sample_task, mock_runner
     ):
         task = sample_task(name="disabled-task", enabled=False)
         past = self._now_aware() - timedelta(hours=1)
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        mock_runner = MagicMock()
-        mock_runner.call.return_value = "x"
-        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
-            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
-            with patch.object(sched_module, "_now_local") as mock_now:
-                mock_now.return_value = self._now_aware()
-                sched._tick()
+        sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+        with patch.object(sched_module, "_now_local") as mock_now:
+            mock_now.return_value = self._now_aware()
+            sched._tick()
 
-        mock_runner.call.assert_not_called()
+        mock_runner.call_ex.assert_not_called()
         mock_email_channel.send_reply.assert_not_called()
 
-    def test_call_claude_返回_None_last_status_failed(
+    def test_未注册的_agent_判失败并发错误邮件(
         self, store, mock_email_channel, sample_task
     ):
+        """task.agent 拼写错 → 不调任何 runner, 直接判失败 (错误信息含可用列表)。"""
+        current = self._now_aware()
+        task = sample_task(name="bad-agent")
+        task.agent = "no-such-agent"
+        past = current - timedelta(hours=1)
+        task.next_run_at = sched_module._format_dt(past)
+        store.add(task)
+
+        with patch.object(
+            sched_module, "get_schedule_config",
+            return_value={"retry_max": 0, "retry_backoff_seconds": 0},
+        ):
+            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+            with patch.object(sched_module, "_now_local") as mock_now:
+                mock_now.return_value = current
+                sched._tick()
+
+        t = store.get("bad-agent")
+        assert t.last_status == STATUS_FAILED
+        assert "no-such-agent" in t.last_error
+        assert mock_email_channel.send_reply.call_count == 1
+
+    def test_agent_失败_写入真实详情(
+        self, store, mock_email_channel, sample_task, mock_runner
+    ):
+        """AI 失败 → last_status=failed, 且 last_error 含真实原因 (不再是笼统"返回 None")。"""
         current = self._now_aware()
         task = sample_task(name="claude-fail")
         past = current - timedelta(hours=1)
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        mock_runner = MagicMock()
-        mock_runner.call.return_value = None
-        mock_runner.name = "claude"
-        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
+        mock_runner.call_ex.return_value = AgentResult(
+            ok=False,
+            kind=AgentErrorKind.NONZERO_EXIT,
+            exit_code=1,
+            error="claude 子进程失败 returncode=1: API Error: Stream error: error decoding response body",
+        )
+        sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+        with patch.object(sched_module, "_now_local") as mock_now:
+            mock_now.return_value = current
+            sched._tick()
+
+        t = store.get("claude-fail")
+        assert t.last_status == STATUS_FAILED
+        assert t.last_error
+        assert "Stream error" in t.last_error
+        assert "返回 None" not in t.last_error
+        # 失败 → 发一封错误通知邮件, 正文带真实原因
+        assert mock_email_channel.send_reply.call_count == 1
+        email_body = mock_email_channel.send_reply.call_args.kwargs["body"]
+        assert "Stream error" in email_body
+        # last_run_at 记录的是实际执行时间 (tick 时刻), 而非派发时刻也非空
+        assert t.last_run_at is not None
+
+    def test_瞬态失败_重试后成功(
+        self, store, mock_email_channel, sample_task, mock_runner
+    ):
+        """瞬态失败 (非零退出码) → 按 retry_max 重试 → 第二次成功 → SUCCESS。"""
+        current = self._now_aware()
+        task = sample_task(name="retry-ok")
+        past = current - timedelta(hours=1)
+        task.next_run_at = sched_module._format_dt(past)
+        store.add(task)
+
+        fail = AgentResult(ok=False, kind=AgentErrorKind.NONZERO_EXIT, exit_code=1, error="boom")
+        mock_runner.call_ex.side_effect = [fail, AgentResult(ok=True, output="recovered")]
+        with patch.object(
+            sched_module, "get_schedule_config",
+            return_value={"retry_max": 1, "retry_backoff_seconds": 0},
+        ):
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = current
                 sched._tick()
 
-        t = store.get("claude-fail")
-        assert t.last_status == STATUS_FAILED
-        assert t.last_error  # 非空
-        assert "None" in t.last_error
+        assert mock_runner.call_ex.call_count == 2
+        t = store.get("retry-ok")
+        assert t.last_status == STATUS_SUCCESS
+        # 成功只发一封结果邮件 (重试期间不发错误邮件)
+        assert mock_email_channel.send_reply.call_count == 1
+        assert mock_email_channel.send_reply.call_args.kwargs["body"] == "recovered"
 
-    def test_dry_run_True_调_call_claude_不发邮件(
-        self, store, mock_email_channel, sample_task
+    def test_瞬态失败_耗尽重试_判失败(
+        self, store, mock_email_channel, sample_task, mock_runner
+    ):
+        """瞬态失败持续存在 → 耗尽 retry_max 后判失败, 错误邮件带"重试 N 次"。"""
+        current = self._now_aware()
+        task = sample_task(name="retry-exhausted")
+        past = current - timedelta(hours=1)
+        task.next_run_at = sched_module._format_dt(past)
+        store.add(task)
+
+        mock_runner.call_ex.return_value = AgentResult(
+            ok=False, kind=AgentErrorKind.NONZERO_EXIT, exit_code=1, error="boom",
+        )
+        with patch.object(
+            sched_module, "get_schedule_config",
+            return_value={"retry_max": 1, "retry_backoff_seconds": 0},
+        ):
+            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+            with patch.object(sched_module, "_now_local") as mock_now:
+                mock_now.return_value = current
+                sched._tick()
+
+        # retry_max=1 → 首次 + 1 次重试, 共 2 次
+        assert mock_runner.call_ex.call_count == 2
+        t = store.get("retry-exhausted")
+        assert t.last_status == STATUS_FAILED
+        assert "重试 1 次后仍失败" in t.last_error
+        # 最终失败才发一封错误邮件
+        assert mock_email_channel.send_reply.call_count == 1
+
+    def test_非瞬态失败则不重试(
+        self, store, mock_email_channel, sample_task, mock_runner
+    ):
+        """timeout / not_found 是确定性失败, 即使 retry_max 很大也不重试。"""
+        current = self._now_aware()
+        task = sample_task(name="no-retry-timeout")
+        past = current - timedelta(hours=1)
+        task.next_run_at = sched_module._format_dt(past)
+        store.add(task)
+
+        mock_runner.call_ex.return_value = AgentResult(
+            ok=False, kind=AgentErrorKind.TIMEOUT, error="claude 子进程超时 (>1800s)",
+        )
+        with patch.object(
+            sched_module, "get_schedule_config",
+            return_value={"retry_max": 5, "retry_backoff_seconds": 0},
+        ):
+            sched = Scheduler(mock_email_channel, store, tick_seconds=60)
+            with patch.object(sched_module, "_now_local") as mock_now:
+                mock_now.return_value = current
+                sched._tick()
+
+        assert mock_runner.call_ex.call_count == 1
+        t = store.get("no-retry-timeout")
+        assert t.last_status == STATUS_FAILED
+        assert "超时" in t.last_error
+
+    def test_dry_run_True_调_runner_不发邮件(
+        self, store, mock_email_channel, sample_task, mock_runner
     ):
         current = self._now_aware()
         task = sample_task(name="dry-task")
@@ -468,20 +609,18 @@ class TestTrigger:
         sched = Scheduler(
             mock_email_channel, store, dry_run=True, tick_seconds=60
         )
-        mock_runner = MagicMock()
-        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
-            with patch.object(sched_module, "_now_local") as mock_now:
-                mock_now.return_value = current
-                sched._tick()
+        with patch.object(sched_module, "_now_local") as mock_now:
+            mock_now.return_value = current
+            sched._tick()
 
-        # dry_run 模式: 既不调 Claude 也不发邮件
-        mock_runner.call.assert_not_called()
+        # dry_run 模式: 既不调 AI 也不发邮件
+        mock_runner.call_ex.assert_not_called()
         mock_email_channel.send_reply.assert_not_called()
         t = store.get("dry-task")
         assert t.last_status == STATUS_DRY_RUN
 
     def test_send_reply_返回_False_last_status_failed(
-        self, store, sample_task
+        self, store, sample_task, mock_runner
     ):
         channel = MagicMock()
         channel.send_reply.return_value = (False, None)
@@ -492,13 +631,11 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        mock_runner = MagicMock()
-        mock_runner.call.return_value = "out"
-        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
-            sched = Scheduler(channel, store, tick_seconds=60)
-            with patch.object(sched_module, "_now_local") as mock_now:
-                mock_now.return_value = current
-                sched._tick()
+        mock_runner.call_ex.return_value = AgentResult(ok=True, output="out")
+        sched = Scheduler(channel, store, tick_seconds=60)
+        with patch.object(sched_module, "_now_local") as mock_now:
+            mock_now.return_value = current
+            sched._tick()
 
         t = store.get("smtp-fail")
         assert t.last_status == STATUS_FAILED
