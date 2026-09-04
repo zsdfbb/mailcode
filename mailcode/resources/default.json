@@ -46,5 +46,16 @@
     "max_concurrent": 1,
     "missed_run_policy": "skip",
     "default_timeout_seconds": 1800
+  },
+  "default_agent": "claude",
+  "agents": {
+    "claude": {
+      "command": "claude",
+      "extra_args": ["--dangerously-skip-permissions"]
+    },
+    "pi": {
+      "command": "pi",
+      "extra_args": []
+    }
   }
 }

@@ -21,6 +21,7 @@ from email.utils import parseaddr
 from mailcode.config import get_imap_config, get_email_config, get_auth_policy, is_session_enabled
 from mailcode.channels.email_channel import EmailChannel
 from mailcode.relay.security import SecurityChecker
+from mailcode.utils.paths import sessions_file, legacy_sessions_file
 
 if TYPE_CHECKING:
     from mailcode.relay.conversation_handler import ConversationHandler
@@ -82,10 +83,12 @@ class _Backoff:
 
 
 class IMAPListener:
-    def __init__(self, imap_config=None, email_config=None, smtp_config=None):
+    def __init__(self, imap_config=None, email_config=None, smtp_config=None,
+                 agent_name: str = "claude"):
         self.imap_config = imap_config or get_imap_config()
         self.email_config = email_config or get_email_config()
         self.smtp_config = smtp_config
+        self.agent_name = agent_name
 
         _MAILCODE_HOME.mkdir(parents=True, exist_ok=True)
         self.state_path = _MAILCODE_HOME / "state.json"
@@ -700,9 +703,11 @@ class IMAPListener:
         subject = email_entry.get("subject", "")
 
         if command == "status":
-            # Get active session count
+            # Get active session count (new path first, then legacy fallback)
             try:
-                mapping_file = _MAILCODE_HOME / "claude_sessions.json"
+                mapping_file = sessions_file("claude")
+                if not mapping_file.exists():
+                    mapping_file = legacy_sessions_file()
                 session_count = 0
                 if mapping_file.exists():
                     import json
@@ -733,7 +738,9 @@ class IMAPListener:
             )
         elif command == "sessions":
             try:
-                mapping_file = _MAILCODE_HOME / "claude_sessions.json"
+                mapping_file = sessions_file("claude")
+                if not mapping_file.exists():
+                    mapping_file = legacy_sessions_file()
                 if mapping_file.exists():
                     import json
                     with open(mapping_file) as f:
@@ -836,6 +843,7 @@ class IMAPListener:
             from mailcode.relay.conversation_handler import ConversationHandler
             self._conv_handler = ConversationHandler(
                 email_channel=self.email_channel,
+                agent_name=self.agent_name,
             )
 
         success = self._conv_handler.handle_email(
@@ -867,6 +875,7 @@ class IMAPListener:
             from mailcode.relay.resume_handler import ResumeConversationHandler
             self._resume_handler = ResumeConversationHandler(
                 email_channel=self.email_channel,
+                agent_name=self.agent_name,
             )
 
         success = self._resume_handler.handle_email(
@@ -906,6 +915,7 @@ class IMAPListener:
             from mailcode.relay.stateless_handler import StatelessHandler
             self._stateless_handler = StatelessHandler(
                 email_channel=self.email_channel,
+                agent_name=self.agent_name,
             )
 
         success = self._stateless_handler.handle_email(

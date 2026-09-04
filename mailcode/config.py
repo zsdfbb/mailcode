@@ -101,7 +101,36 @@ def load_config(force_reload: bool = False) -> Dict[str, Any]:
             print("   请手动检查并修复该文件，或运行 mailcode config init --force 重新创建", file=sys.stderr)
             sys.exit(1)
 
+    # 内存补全: 老 config 没有 agent 字段时自动填充 (不写回磁盘)
+    _merge_default_agents(_config_cache)
+
     return _config_cache
+
+
+def _merge_default_agents(config: dict) -> None:
+    """内存补全 default_agent + agents 字段, 不写回磁盘。
+
+    兼容逻辑:
+    - 老 config 无 default_agent → 用顶层 "agent" 字段, 再回退 "claude"
+    - 老 config 无 agents → 内置 claude + pi 默认块
+    - 用户手写了 agents 但没写 default_agent → default "claude"
+    """
+    # default_agent: config > legacy "agent" > "claude"
+    if "default_agent" not in config:
+        config["default_agent"] = config.get("agent", "claude")
+
+    # agents: 缺失时用内置默认
+    if "agents" not in config or not config["agents"]:
+        config["agents"] = {
+            "claude": {
+                "command": "claude",
+                "extra_args": ["--dangerously-skip-permissions"],
+            },
+            "pi": {
+                "command": "pi",
+                "extra_args": [],
+            },
+        }
 
 
 def _get_bot_config(config):
@@ -216,6 +245,18 @@ def get_schedule_config() -> Dict[str, Any]:
     return result
 
 
+def get_default_agent() -> str:
+    """返回当前配置的 default_agent, 默认 'claude'。"""
+    config = load_config()
+    return config.get("default_agent", "claude")
+
+
+def get_agent_config(agent_name: str) -> dict:
+    """返回指定 agent 的配置块。找不到返回空 dict。"""
+    config = load_config()
+    return config.get("agents", {}).get(agent_name, {})
+
+
 def validate_serve_config() -> list[str]:
     """校验 serve 启动所需配置项, 返回错误消息列表 (空列表 = 通过)。
 
@@ -260,6 +301,12 @@ def validate_serve_config() -> list[str]:
         allowed = security.get("allowed_senders", [])
         if not allowed:
             errors.append("security.allowed_senders 为空（至少应包含自己的邮箱）")
+
+        # agent 校验
+        default_agent = config.get("default_agent", "claude")
+        agents = config.get("agents", {})
+        if agents and default_agent not in agents:
+            errors.append(f"default_agent '{default_agent}' 不在 agents 配置中, 可用: {sorted(agents.keys())}")
 
         # schedule 段可选校验 (warn 而非阻塞)
         schedule_cfg = config.get("schedule", {})

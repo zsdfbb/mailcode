@@ -129,6 +129,19 @@ def run_health(send_test: bool = True) -> bool:
 
     mail.logout()
 
+    # ---- agent 检查 ----
+    try:
+        from mailcode.utils.agent import list_agents, get_runner
+        _check("Agents", True, "")
+        for agent_name in list_agents():
+            runner = get_runner(agent_name)
+            if runner.is_available():
+                _check(f"  {agent_name}", True, f"✓")
+            else:
+                _check(f"  {agent_name}", False, runner.hint_for_failure())
+    except Exception:
+        _check("Agents", False, "无法加载 agent 注册表")
+
     print(f"\n{'='*30}")
     print(f"结果: {'全部正常' if all_ok else '存在问题'}")
     return all_ok

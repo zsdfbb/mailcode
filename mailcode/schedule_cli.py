@@ -155,6 +155,7 @@ def cmd_schedule_show(store: ScheduleStore, name: str):
     if s.day_of_month is not None:
         print(f"Day of month:   {s.day_of_month}")
     print(f"Schedule str:   {_format_schedule_str(task)}")
+    print(f"Agent:          {task.agent or 'claude (default)'}")
     print(f"Cwd:            {task.cwd or '-'}")
     print(f"To email:       {task.to_email}")
     print(f"Subject prefix: {task.subject_prefix}")
@@ -186,6 +187,7 @@ def cmd_schedule_add(
     to_email: Optional[str] = None,
     cwd: Optional[str] = None,
     subject_prefix: Optional[str] = None,
+    agent: Optional[str] = None,
     interactive: bool = True,
 ):
     """添加一个新定时任务。
@@ -280,6 +282,7 @@ def cmd_schedule_add(
         to_email=to_email,
         subject_prefix=subject_prefix or "Schedule:",
         next_run_at=next_iso,
+        agent=agent,
     )
 
     try:

@@ -143,6 +143,30 @@ def mock_opencode_missing():
 
 
 @pytest.fixture
+def mock_claude_runner():
+    """Mock ClaudeRunner 用于测试 — 返回固定 response。"""
+    mock = MagicMock()
+    mock.name = "claude"
+    mock.call.return_value = "mocked claude response"
+    mock.is_available.return_value = True
+    mock.hint_for_failure.return_value = "mocked hint"
+    with patch("mailcode.utils.agent.get_runner", return_value=mock):
+        yield mock
+
+
+@pytest.fixture
+def mock_pi_runner():
+    """Mock PiRunner 用于测试 — 返回固定 response。"""
+    mock = MagicMock()
+    mock.name = "pi"
+    mock.call.return_value = "mocked pi response"
+    mock.is_available.return_value = True
+    mock.hint_for_failure.return_value = "mocked hint"
+    with patch("mailcode.utils.agent.get_runner", return_value=mock):
+        yield mock
+
+
+@pytest.fixture
 def sample_email():
     """工厂函数，快速构建标准测试邮件 dict"""
     def _make_email(

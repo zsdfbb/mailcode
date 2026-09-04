@@ -22,8 +22,9 @@ class StatelessHandler:
         - cwd 解析复用 ``extract_cwd`` / ``strip_cwd`` (行为对齐)
     """
 
-    def __init__(self, email_channel):
+    def __init__(self, email_channel, agent_name: str = "claude"):
         self.email_channel = email_channel
+        self.agent_name = agent_name
 
     def handle_email(self, from_email: str, subject: str, body: str,
                      references: str = "", in_reply_to: str = "") -> bool:

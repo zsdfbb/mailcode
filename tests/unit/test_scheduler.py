@@ -355,7 +355,9 @@ class TestSchedulerLifecycle:
         assert not sched.is_alive()
 
     def test_trigger_now_同步等结果(self, store, mock_email_channel, sample_task):
-        with patch.object(sched_module, "call_claude", return_value="hello"):
+        mock_runner = MagicMock()
+        mock_runner.call.return_value = "hello"
+        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
             store.add(sample_task(name="trigger-me"))
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             # 不需要 start() — trigger_now 是同步方法
@@ -364,7 +366,7 @@ class TestSchedulerLifecycle:
             assert updated.last_status == STATUS_SUCCESS
             # Claude 被调一次, 邮件发一次
             assert mock_email_channel.send_reply.call_count == 1
-            assert sched_module.call_claude.call_count == 1
+            assert mock_runner.call.call_count == 1
 
     def test_trigger_now_找不到任务_返回_None(
         self, store, mock_email_channel
@@ -394,16 +396,16 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        with patch.object(
-            sched_module, "call_claude", return_value="claude output"
-        ) as mock_claude:
+        mock_runner = MagicMock()
+        mock_runner.call.return_value = "claude output"
+        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             fixed_now = self._now_aware()
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = fixed_now
                 sched._tick()
 
-        assert mock_claude.call_count == 1
+        assert mock_runner.call.call_count == 1
         assert mock_email_channel.send_reply.call_count == 1
         # 验证 task 状态被更新
         t = store.get("tick-me")
@@ -419,13 +421,15 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        with patch.object(sched_module, "call_claude", return_value="x") as mock_claude:
+        mock_runner = MagicMock()
+        mock_runner.call.return_value = "x"
+        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = self._now_aware()
                 sched._tick()
 
-        mock_claude.assert_not_called()
+        mock_runner.call.assert_not_called()
         mock_email_channel.send_reply.assert_not_called()
 
     def test_call_claude_返回_None_last_status_failed(
@@ -437,7 +441,10 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        with patch.object(sched_module, "call_claude", return_value=None):
+        mock_runner = MagicMock()
+        mock_runner.call.return_value = None
+        mock_runner.name = "claude"
+        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
             sched = Scheduler(mock_email_channel, store, tick_seconds=60)
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = current
@@ -457,17 +464,18 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        # dry_run=True 时, _run_task 早 return, 不调 call_claude
+        # dry_run=True 时, _run_task 早 return, 不调 runner
         sched = Scheduler(
             mock_email_channel, store, dry_run=True, tick_seconds=60
         )
-        with patch.object(sched_module, "call_claude") as mock_claude:
+        mock_runner = MagicMock()
+        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = current
                 sched._tick()
 
         # dry_run 模式: 既不调 Claude 也不发邮件
-        mock_claude.assert_not_called()
+        mock_runner.call.assert_not_called()
         mock_email_channel.send_reply.assert_not_called()
         t = store.get("dry-task")
         assert t.last_status == STATUS_DRY_RUN
@@ -484,7 +492,9 @@ class TestTrigger:
         task.next_run_at = sched_module._format_dt(past)
         store.add(task)
 
-        with patch.object(sched_module, "call_claude", return_value="out"):
+        mock_runner = MagicMock()
+        mock_runner.call.return_value = "out"
+        with patch("mailcode.utils.agent.get_runner", return_value=mock_runner):
             sched = Scheduler(channel, store, tick_seconds=60)
             with patch.object(sched_module, "_now_local") as mock_now:
                 mock_now.return_value = current

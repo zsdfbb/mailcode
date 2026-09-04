@@ -656,3 +656,132 @@ class TestCustomConfigPath:
         assert default == expected
 
 
+# ============================================================
+# agents 子命令
+# ============================================================
+
+
+class TestAgents:
+    def test_agents_subcommand_registered(self):
+        """agents 应注册为顶级子命令"""
+        parser = build_parser()
+        args = parser.parse_args(["agents", "list"])
+        assert args.command == "agents"
+        assert args.agents_command == "list"
+
+    def test_agents_list_output(self, capsys):
+        """agents list 应列出 agent"""
+        from mailcode.cli import cmd_agents
+
+        with patch("mailcode.utils.agent.list_agents", return_value=["claude", "pi"]), \
+             patch("mailcode.utils.agent.get_runner") as mock_get:
+            # mock claude available, pi unavailable
+            claude_runner = MagicMock()
+            claude_runner.is_available.return_value = True
+            pi_runner = MagicMock()
+            pi_runner.is_available.return_value = False
+            pi_runner.hint_for_failure.return_value = "pi 未安装"
+
+            def _get(name):
+                return {"claude": claude_runner, "pi": pi_runner}[name]
+            mock_get.side_effect = _get
+
+            class FakeArgs:
+                agents_command = "list"
+
+            cmd_agents(FakeArgs())
+            out = capsys.readouterr().out
+            assert "claude" in out
+            assert "pi" in out
+            assert "pi 未安装" in out
+
+    def test_agents_no_subcommand_exits(self):
+        """agents 不带子命令应 exit 1"""
+        from mailcode.cli import cmd_agents
+
+        class FakeArgs:
+            agents_command = None
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_agents(FakeArgs())
+        assert exc.value.code == 1
+
+
+# ============================================================
+# chat --agent 参数
+# ============================================================
+
+
+class TestChatAgentParam:
+    def test_chat_agent_default(self):
+        """chat 默认 agent=claude"""
+        parser = build_parser()
+        args = parser.parse_args(["chat"])
+        assert args.agent == "claude"
+
+    def test_chat_agent_pi(self):
+        """chat --agent pi 应解析"""
+        parser = build_parser()
+        args = parser.parse_args(["chat", "--agent", "pi"])
+        assert args.agent == "pi"
+
+
+# ============================================================
+# serve --agent 参数
+# ============================================================
+
+
+class TestServeAgentParam:
+    def test_serve_agent_default(self):
+        """serve 默认 agent=claude"""
+        parser = build_parser()
+        args = parser.parse_args(["serve"])
+        assert getattr(args, "agent", "claude") == "claude"
+
+
+# ============================================================
+# config migrate-agents
+# ============================================================
+
+
+class TestConfigMigrateAgents:
+    def test_migrate_agents_subcommand_registered(self):
+        """config migrate-agents 应注册"""
+        parser = build_parser()
+        args = parser.parse_args(["config", "migrate-agents"])
+        assert args.command == "config"
+        assert args.config_command == "migrate-agents"
+        assert args.apply is False
+        assert args.agent == "claude"
+
+    def test_migrate_agents_apply_flag(self):
+        """config migrate-agents --apply"""
+        parser = build_parser()
+        args = parser.parse_args(["config", "migrate-agents", "--apply"])
+        assert args.apply is True
+
+    def test_migrate_agents_agent_flag(self):
+        """config migrate-agents --agent pi"""
+        parser = build_parser()
+        args = parser.parse_args(["config", "migrate-agents", "--agent", "pi"])
+        assert args.agent == "pi"
+
+
+# ============================================================
+# description 更新
+# ============================================================
+
+
+class TestDescription:
+    def test_description_mentions_claude_pi(self):
+        """build_parser description 应提及 Claude / Pi"""
+        parser = build_parser()
+        # parse_args([]) 不会触发 description, 但我们可以直接检查
+        assert "Claude / Pi" in parser.description
+
+    def test_description_does_not_mention_opencode(self):
+        """description 不应提及 OpenCode"""
+        parser = build_parser()
+        assert "OpenCode" not in parser.description
+
+

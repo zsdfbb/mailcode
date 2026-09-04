@@ -16,14 +16,17 @@ from pathlib import Path
 from typing import Optional
 
 from mailcode.relay.conversation_handler import extract_cwd, strip_cwd, send_error_email
-from mailcode.utils import claude_runner as cr_module
+from mailcode.utils.agent import get_runner
+from mailcode.utils import paths
 
 logger = logging.getLogger(__name__)
 
 # MailCode 主目录
 _MAILCODE_HOME = Path.home() / ".config" / "mailcode"
-_TRANSCRIPTS_DIR = _MAILCODE_HOME / "transcripts"
-_MAPPING_FILE = _MAILCODE_HOME / "claude_sessions.json"
+
+# ---- Legacy 路径 (claude agent 读 fallback 用, 不再写入) ----
+_LEGACY_TRANSCRIPTS_DIR = _MAILCODE_HOME / "transcripts"
+_LEGACY_MAPPING_FILE = _MAILCODE_HOME / "claude_sessions.json"
 
 
 class ResumeConversationHandler:
@@ -34,8 +37,10 @@ class ResumeConversationHandler:
     - 记录 transcripts 用于审计和调试
     """
 
-    def __init__(self, email_channel):
+    def __init__(self, email_channel, agent_name: str = "claude"):
         self.email_channel = email_channel
+        self.agent_name = agent_name
+        self.runner = get_runner(agent_name)
         self._ensure_dirs()
 
     # ------------------------------------------------------------------ #
@@ -44,8 +49,8 @@ class ResumeConversationHandler:
 
     def _ensure_dirs(self):
         """确保数据目录存在。"""
-        _MAILCODE_HOME.mkdir(parents=True, exist_ok=True)
-        _TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        paths.agent_home(self.agent_name).mkdir(parents=True, exist_ok=True)
+        paths.transcripts_dir(self.agent_name).mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ #
     # Mapping IO — claude_sessions.json
@@ -56,11 +61,26 @@ class ResumeConversationHandler:
         return {"version": 1, "threads": {}}
 
     def _load_mapping(self) -> dict:
-        """加载 claude_sessions.json。文件不存在或损坏返回空文档。"""
-        if not _MAPPING_FILE.exists():
+        """加载 claude_sessions.json。文件不存在或损坏返回空文档。
+
+        Legacy fallback: 当 agent_name == "claude" 且新路径不存在时,
+        尝试从旧路径读取。
+        """
+        mapping_file = paths.sessions_file(self.agent_name)
+        if not mapping_file.exists():
+            # Legacy fallback: claude agent 且新路径不存在时读旧路径
+            if self.agent_name == "claude" and _LEGACY_MAPPING_FILE.exists():
+                try:
+                    with open(_LEGACY_MAPPING_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data.get("threads"), dict):
+                        data.setdefault("version", 1)
+                        return data
+                except (json.JSONDecodeError, IOError):
+                    pass  # 损坏则 fallback 到空文档
             return self._empty_mapping()
         try:
-            with open(_MAPPING_FILE, "r", encoding="utf-8") as f:
+            with open(mapping_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
             logger.warning("claude_sessions.json 损坏: %s, 回退为空", e)
@@ -73,17 +93,18 @@ class ResumeConversationHandler:
     def _save_mapping(self, data: dict):
         """原子写 claude_sessions.json (tmp + replace)。"""
         data["version"] = 1
-        tmp_path = _MAPPING_FILE.with_suffix(_MAPPING_FILE.suffix + ".tmp")
+        mapping_file = paths.sessions_file(self.agent_name)
+        tmp_path = mapping_file.with_suffix(mapping_file.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp_path.replace(_MAPPING_FILE)
+        tmp_path.replace(mapping_file)
 
     # ------------------------------------------------------------------ #
     # Transcript IO — transcripts/<uuid>.json
     # ------------------------------------------------------------------ #
 
     def _transcript_path(self, session_id: str) -> Path:
-        return _TRANSCRIPTS_DIR / f"{session_id}.json"
+        return paths.transcripts_dir(self.agent_name) / f"{session_id}.json"
 
     @staticmethod
     def _empty_transcript(session_id: str, user_email: str) -> dict:
@@ -233,7 +254,7 @@ class ResumeConversationHandler:
             self._save_transcript(claude_session_id, transcript)
 
         # ------ 3. 调 claude ------ #
-        response = cr_module.call_claude(
+        response = self.runner.call(
             clean_body,
             cwd=cwd,
             session_id=claude_session_id,
@@ -244,12 +265,7 @@ class ResumeConversationHandler:
         if response is None:
             logger.error("claude 调用失败, 通知用户: from=%s", from_email)
 
-            # 检查 claude 是否可用
-            import shutil
-            if shutil.which("claude") is None:
-                hint = "Claude Code 未安装或不在 PATH 中。请先安装 Claude Code，或检查 PATH 配置。"
-            else:
-                hint = "AI 处理失败，可能由于超时或进程异常。请简化问题后重试，或稍后再试。"
+            hint = self.runner.hint_for_failure()
 
             send_error_email(
                 self.email_channel, from_email, subject,

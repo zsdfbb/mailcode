@@ -1,4 +1,4 @@
-"""Claude 子进程调用器 — 供 ConversationHandler / Scheduler 复用。
+"""Claude 子进程调用器 -- 供 ConversationHandler / Scheduler 复用。
 
 抽出此模块是为了避免 scheduler 与 conversation_handler 双份实现
 ``claude -p`` 调用逻辑导致行为漂移 (超时、参数、cwd 默认值等)。
@@ -10,11 +10,38 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .agent import BaseAgentRunner
+
 logger = logging.getLogger(__name__)
 
-# claude 子进程默认超时 (秒) — 24h 兜底, 实际调用方应传更短的值
+# claude 子进程默认超时 (秒) -- 24h 兜底, 实际调用方应传更短的值
 # (Scheduler 默认 1800s, ConversationHandler 用 session.response_timeout_seconds)
 CLAUDE_TIMEOUT_SECONDS = 86400
+
+
+class ClaudeRunner(BaseAgentRunner):
+    """Claude Code agent runner。"""
+
+    name = "claude"
+
+    def _command(self) -> str:
+        return "claude"
+
+    def _build_args(self, *, session_id: Optional[str], resume: bool,
+                    no_session: bool) -> list[str]:
+        args = ["claude", "--dangerously-skip-permissions"]
+        if session_id is not None:
+            args.extend(["--session-id", session_id])
+        if resume:
+            args.append("--resume")
+        return args
+
+    def hint_for_failure(self) -> str:
+        return (
+            "Claude Code 未安装或不在 PATH 中。"
+            "请运行 'claude --version' 验证, 或访问 "
+            "https://docs.anthropic.com/zh-CN/docs/claude-code 安装。"
+        )
 
 
 def call_claude(

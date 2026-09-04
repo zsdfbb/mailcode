@@ -240,3 +240,111 @@ def test_get_session_config_merges_user_over_default(monkeypatch, tmp_path):
     assert sess["session_ttl_days"] == 30
     # is_session_enabled 也跟着返回 False
     assert is_session_enabled() is False
+
+
+# ============================================================
+# agent 配置测试
+# ============================================================
+
+
+def test_get_default_agent_returns_claude_default(monkeypatch, tmp_path):
+    """空 config 无 default_agent 时返回 'claude'"""
+    cfg = {"mailcode_bot": {"email": "bot@test.com", "password": "secret"}}
+    p = tmp_path / "config.json"
+    with open(p, "w") as f:
+        json.dump(cfg, f)
+    monkeypatch.setattr("mailcode.config.USER_CONFIG_PATH", p)
+    monkeypatch.setattr("mailcode.config._config_cache", None)
+
+    from mailcode.config import get_default_agent
+    assert get_default_agent() == "claude"
+
+
+def test_get_default_agent_custom(monkeypatch, tmp_path):
+    """config 含 default_agent 时返回自定义值"""
+    cfg = {
+        "mailcode_bot": {"email": "bot@test.com", "password": "secret"},
+        "default_agent": "pi",
+    }
+    p = tmp_path / "config.json"
+    with open(p, "w") as f:
+        json.dump(cfg, f)
+    monkeypatch.setattr("mailcode.config.USER_CONFIG_PATH", p)
+    monkeypatch.setattr("mailcode.config._config_cache", None)
+
+    from mailcode.config import get_default_agent
+    assert get_default_agent() == "pi"
+
+
+def test_get_agent_config_found(monkeypatch, tmp_path):
+    """找到指定 agent 时返回其配置 dict"""
+    cfg = {
+        "mailcode_bot": {"email": "bot@test.com", "password": "secret"},
+        "agents": {
+            "claude": {"command": "claude", "extra_args": ["--dangerously-skip-permissions"]},
+        },
+    }
+    p = tmp_path / "config.json"
+    with open(p, "w") as f:
+        json.dump(cfg, f)
+    monkeypatch.setattr("mailcode.config.USER_CONFIG_PATH", p)
+    monkeypatch.setattr("mailcode.config._config_cache", None)
+
+    from mailcode.config import get_agent_config
+    result = get_agent_config("claude")
+    assert result["command"] == "claude"
+    assert "--dangerously-skip-permissions" in result["extra_args"]
+
+
+def test_get_agent_config_missing(monkeypatch, tmp_path):
+    """找不到指定 agent 时返回空 dict"""
+    cfg = {"mailcode_bot": {"email": "bot@test.com", "password": "secret"}}
+    p = tmp_path / "config.json"
+    with open(p, "w") as f:
+        json.dump(cfg, f)
+    monkeypatch.setattr("mailcode.config.USER_CONFIG_PATH", p)
+    monkeypatch.setattr("mailcode.config._config_cache", None)
+
+    from mailcode.config import get_agent_config
+    assert get_agent_config("nonexistent") == {}
+
+
+def test_validate_default_agent_in_agents(monkeypatch, tmp_path):
+    """default_agent 不在 agents 中时 errors 包含相关消息"""
+    cfg = {
+        "mailcode_bot": {"email": "bot@test.com", "password": "secret"},
+        "security": {"allowed_senders": ["admin@test.com"], "auth_policy": "off"},
+        "default_agent": "nonexistent",
+        "agents": {"claude": {"command": "claude"}},
+    }
+    p = tmp_path / "config.json"
+    with open(p, "w") as f:
+        json.dump(cfg, f)
+    monkeypatch.setattr("mailcode.config.USER_CONFIG_PATH", p)
+    monkeypatch.setattr("mailcode.config._config_cache", None)
+
+    from mailcode.config import validate_serve_config
+    errors = validate_serve_config()
+    agent_errors = [e for e in errors if "default_agent" in e]
+    assert len(agent_errors) == 1
+    assert "nonexistent" in agent_errors[0]
+
+
+def test_validate_default_agent_ok(monkeypatch, tmp_path):
+    """default_agent 在 agents 中时 errors 不含 agent 相关条目"""
+    cfg = {
+        "mailcode_bot": {"email": "bot@test.com", "password": "secret"},
+        "security": {"allowed_senders": ["admin@test.com"], "auth_policy": "off"},
+        "default_agent": "claude",
+        "agents": {"claude": {"command": "claude"}},
+    }
+    p = tmp_path / "config.json"
+    with open(p, "w") as f:
+        json.dump(cfg, f)
+    monkeypatch.setattr("mailcode.config.USER_CONFIG_PATH", p)
+    monkeypatch.setattr("mailcode.config._config_cache", None)
+
+    from mailcode.config import validate_serve_config
+    errors = validate_serve_config()
+    agent_errors = [e for e in errors if "default_agent" in e]
+    assert agent_errors == []

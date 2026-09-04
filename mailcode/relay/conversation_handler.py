@@ -8,14 +8,19 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from mailcode.utils import claude_runner as cr_module
+from mailcode.utils.agent import get_runner
+from mailcode.utils import paths
 
 logger = logging.getLogger(__name__)
 
 # MailCode 主目录
 _MAILCODE_HOME = Path.home() / ".config" / "mailcode"
+
+# ---- Legacy 路径 (claude agent 读 fallback 用, 不再写入) ----
 _CONV_DIR = _MAILCODE_HOME / "conversations"
 _INDEX_FILE = _CONV_DIR / "index.json"
+
+# ---- 文件名前缀/后缀 (新旧路径通用) ----
 _SESSION_PREFIX = "session_"
 _SESSION_EXT = ".json"
 
@@ -102,8 +107,10 @@ class ConversationHandler:
     (读取 session 文件 + cwd 下的 CLAUDE.md), MailCode 只做"dumb pipe"。
     """
 
-    def __init__(self, email_channel):
+    def __init__(self, email_channel, agent_name: str = "claude"):
         self.email_channel = email_channel
+        self.agent_name = agent_name
+        self.runner = get_runner(agent_name)
         self._ensure_dirs()
 
     # ------------------------------------------------------------------ #
@@ -112,8 +119,10 @@ class ConversationHandler:
 
     def _ensure_dirs(self):
         """确保对话数据目录存在, 必要时初始化 index.json。"""
-        _CONV_DIR.mkdir(parents=True, exist_ok=True)
-        if not _INDEX_FILE.exists():
+        conv_dir = paths.conversations_dir(self.agent_name)
+        index_file = paths.conversations_dir(self.agent_name) / "index.json"
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        if not index_file.exists():
             self._save_index({
                 "version": 1,
                 "updated_at": time.time(),
@@ -121,7 +130,7 @@ class ConversationHandler:
             })
 
     def _session_path(self, session_id: str) -> Path:
-        return _CONV_DIR / f"{_SESSION_PREFIX}{session_id}{_SESSION_EXT}"
+        return paths.conversations_dir(self.agent_name) / f"{_SESSION_PREFIX}{session_id}{_SESSION_EXT}"
 
     def _bot_email(self) -> str:
         """从 email_channel 派生机器人邮箱 (作为 outgoing 的 from / incoming 的 to)。"""
@@ -157,9 +166,25 @@ class ConversationHandler:
         }
 
     def _load_session(self, session_id: str) -> dict:
-        """加载 session 数据。文件不存在返回空 session; 损坏返回空 + warn。"""
+        """加载 session 数据。文件不存在返回空 session; 损坏返回空 + warn。
+
+        Legacy fallback: 当 agent_name == "claude" 且新路径不存在时,
+        尝试从旧路径 (~/.config/mailcode/conversations/) 读取。
+        """
         path = self._session_path(session_id)
         if not path.exists():
+            # Legacy fallback: claude agent 且新路径不存在时读旧路径
+            if self.agent_name == "claude":
+                legacy_path = _CONV_DIR / f"{_SESSION_PREFIX}{session_id}{_SESSION_EXT}"
+                if legacy_path.exists():
+                    try:
+                        with open(legacy_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        # 迁移到新路径 (写新, 保留旧)
+                        self._save_session(session_id, data)
+                        return data
+                    except (json.JSONDecodeError, IOError):
+                        pass  # 损坏则 fallback 到空 session
             return self._empty_session(session_id)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -194,11 +219,26 @@ class ConversationHandler:
         return {"version": 1, "updated_at": time.time(), "msg_to_session": {}}
 
     def _load_index(self) -> dict:
-        """加载 index.json。文件不存在或损坏返回空 index。"""
-        if not _INDEX_FILE.exists():
+        """加载 index.json。文件不存在或损坏返回空 index。
+
+        Legacy fallback: 当 agent_name == "claude" 且新路径不存在时,
+        尝试从旧路径读取。
+        """
+        index_file = paths.conversations_dir(self.agent_name) / "index.json"
+        if not index_file.exists():
+            # Legacy fallback: claude agent 且新路径不存在时读旧路径
+            if self.agent_name == "claude" and _INDEX_FILE.exists():
+                try:
+                    with open(_INDEX_FILE, "r", encoding="utf-8") as f:
+                        idx = json.load(f)
+                    if isinstance(idx.get("msg_to_session"), dict):
+                        idx.setdefault("version", 1)
+                        return idx
+                except (json.JSONDecodeError, IOError):
+                    pass  # 损坏则 fallback 到空 index
             return self._empty_index()
         try:
-            with open(_INDEX_FILE, "r", encoding="utf-8") as f:
+            with open(index_file, "r", encoding="utf-8") as f:
                 idx = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
             logger.warning("index.json 损坏: %s, 回退为空", e)
@@ -210,11 +250,12 @@ class ConversationHandler:
 
     def _save_index(self, index: dict):
         """原子写 index.json。"""
+        index_file = paths.conversations_dir(self.agent_name) / "index.json"
         index["updated_at"] = time.time()
-        tmp_path = _INDEX_FILE.with_suffix(_INDEX_FILE.suffix + ".tmp")
+        tmp_path = index_file.with_suffix(index_file.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False, indent=2)
-        tmp_path.replace(_INDEX_FILE)
+        tmp_path.replace(index_file)
 
     def _update_index(self, msg_id: str, session_id: str):
         """把 msg_id → session_id 写入 index。空 msg_id 跳过。"""
@@ -240,6 +281,7 @@ class ConversationHandler:
     def _find_session_by_msg_id(self, msg_id: str) -> Optional[str]:
         """通过 msg_id 查找 session_id。index 优先, 全量扫描兜底。
 
+        扫描范围: 新路径 + legacy 路径 (claude agent)。
         返回 session_id 字符串, 找不到返回 None。
         """
         if not msg_id:
@@ -263,8 +305,9 @@ class ConversationHandler:
                 if mid.strip("<>") == bare and self._session_path(sid).exists():
                     return sid
 
-        # 3) 扫描 session_*.json 兜底
-        for path in _CONV_DIR.glob(f"{_SESSION_PREFIX}*{_SESSION_EXT}"):
+        # 3) 扫描新路径 session_*.json 兜底
+        conv_dir = paths.conversations_dir(self.agent_name)
+        for path in conv_dir.glob(f"{_SESSION_PREFIX}*{_SESSION_EXT}"):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -279,6 +322,26 @@ class ConversationHandler:
                     # 顺手把匹配的 msg_id 补回 index
                     self._update_index(mid, sid)
                     return sid
+
+        # 4) 扫描 legacy 路径 (claude agent)
+        if self.agent_name == "claude":
+            for path in _CONV_DIR.glob(f"{_SESSION_PREFIX}*{_SESSION_EXT}"):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    continue
+                for entry in data.get("emails", []):
+                    mid = (entry.get("msg_id") or "").strip()
+                    if not mid:
+                        continue
+                    if mid == key or (bare and mid.strip("<>") == bare):
+                        sid = data.get("session_id") or path.stem[len(_SESSION_PREFIX):]
+                        # 迁移到新路径
+                        self._save_session(sid, data)
+                        self._update_index(mid, sid)
+                        return sid
+
         return None
 
     # ------------------------------------------------------------------ #
@@ -332,7 +395,8 @@ class ConversationHandler:
             return 0
         threshold = time.time() - ttl * 86400
         deleted = 0
-        for path in _CONV_DIR.glob(f"{_SESSION_PREFIX}*{_SESSION_EXT}"):
+        conv_dir = paths.conversations_dir(self.agent_name)
+        for path in conv_dir.glob(f"{_SESSION_PREFIX}*{_SESSION_EXT}"):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -423,7 +487,7 @@ class ConversationHandler:
         session_path = str(self._session_path(session_id))
         prompt = self._build_prompt(session_path)
         cwd = session.get("cwd") or str(Path.home())
-        response = cr_module.call_claude(prompt, cwd=cwd)
+        response = self.runner.call(prompt, cwd=cwd)
 
         # 7. claude 失败 → 写日志 + 发邮件通知用户
         if response is None:
@@ -494,7 +558,8 @@ class ConversationHandler:
     def list_sessions(self) -> list[dict]:
         """列出所有 session (按 last_interaction 降序)。损坏文件 warn 跳过。"""
         sessions = []
-        for path in _CONV_DIR.glob(f"{_SESSION_PREFIX}*{_SESSION_EXT}"):
+        conv_dir = paths.conversations_dir(self.agent_name)
+        for path in conv_dir.glob(f"{_SESSION_PREFIX}*{_SESSION_EXT}"):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)

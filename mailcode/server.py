@@ -43,9 +43,10 @@ def run_serve(args):
     """启动 IMAP 监听器，根据 args 运行（单次轮询 / IDLE / 普通监听）。
 
     Args:
-        args: 具有 dry_run、once、idle 属性的 Namespace 对象。
+        args: 具有 dry_run、once、idle、agent 属性的 Namespace 对象。
     """
-    listener = IMAPListener()
+    agent_name = getattr(args, "agent", "claude")
+    listener = IMAPListener(agent_name=agent_name)
 
     # ---- 事件回调: 控制台实时输出 ----
     _last_hb_print = 0.0

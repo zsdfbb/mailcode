@@ -157,11 +157,20 @@ def cmd_schedule(args):
     elif sub == "delete":
         cmd_schedule_delete(store, args.name, assume_yes=args.yes)
     elif sub == "run-now":
-        from mailcode.utils.claude_runner import call_claude
+        from mailcode.utils.agent import get_runner
         from mailcode.channels.email_channel import EmailChannel
+        # 尝试从 store 读 task.agent, 否则默认 claude
+        agent_name = "claude"
+        try:
+            _task = store.get(args.name)
+            if _task and getattr(_task, "agent", None):
+                agent_name = _task.agent
+        except Exception:
+            pass
+        runner = get_runner(agent_name)
         cmd_schedule_run_now(store, args.name,
             email_channel=EmailChannel(),
-            call_claude_fn=call_claude,
+            call_claude_fn=lambda prompt, cwd: runner.call(prompt, cwd=cwd),
         )
     elif sub == "validate":
         cmd_schedule_validate(store)
@@ -198,8 +207,14 @@ def cmd_config(args):
         print(config_path)
     elif args.config_command == "validate":
         _cmd_config_validate(load_config())
+    elif args.config_command == "migrate-agents":
+        from mailcode.utils.migrate import migrate_legacy
+        migrate_legacy(
+            dry_run=not getattr(args, "apply", False),
+            agent=getattr(args, "agent", "claude"),
+        )
     else:
-        print("用法: mailcode config <show|init|init-test|path|validate>", file=sys.stderr)
+        print("用法: mailcode config <show|init|init-test|path|validate|migrate-agents>", file=sys.stderr)
         sys.exit(1)
 
 
@@ -353,12 +368,28 @@ def cmd_state(args):
         sys.exit(1)
 
 
+def cmd_agents(args):
+    """agents 子命令: list 列出已注册 agent 及其可用性。"""
+    sub = getattr(args, "agents_command", "list")
+    if sub == "list":
+        from mailcode.utils.agent import list_agents, get_runner
+        for name in list_agents():
+            runner = get_runner(name)
+            avail = runner.is_available()
+            icon = "✅" if avail else "❌"
+            hint = "" if avail else f" — {runner.hint_for_failure()}"
+            print(f"{icon} {name}{hint}")
+    else:
+        print("用法: mailcode agents <list>", file=sys.stderr)
+        sys.exit(1)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="mailcode",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "MailCode: 通过 IMAP 邮件远程操控本地 AI Agent (OpenCode / Claude Code)。\n"
+            "MailCode: 通过 IMAP 邮件远程操控本地 AI Agent (Claude / Pi)。\n"
             "\n"
             "工作流: 发件人给机器人邮箱发邮件 → MailCode 在 IMAP 拉取 → 注入到本地 Agent\n"
             "       → Agent 回复内容回写到同一主题 → MailCode 通过 SMTP 把回复转发给发件人。\n"
@@ -435,6 +466,19 @@ def build_parser():
         ))
     p_init_test.add_argument("--force", action="store_true",
                         help="强制重新创建 (先删除已有测试配置)")
+
+    p_migrate = p_config_sub.add_parser(
+        "migrate-agents",
+        help="迁移旧版 agent 数据到按 agent 隔离的目录",
+        description=(
+            "将 ~/.config/mailcode/ 下的旧版 claude_sessions.json / transcripts / conversations "
+            "迁移到 ~/.config/mailcode/<agent>/ 目录结构。默认 dry-run 模式, 加 --apply 实际执行。"
+        ),
+    )
+    p_migrate.add_argument("--apply", action="store_true",
+                           help="实际执行迁移 (默认 dry-run)")
+    p_migrate.add_argument("--agent", default="claude",
+                           help="目标 agent 名 (默认 claude)")
 
     # ── health ──
     p_health = subparsers.add_parser(
@@ -565,6 +609,16 @@ def build_parser():
     )
     p_chat.add_argument("--session-id", help="恢复已有对话的 session ID")
     p_chat.add_argument("--cwd", default="", help="Claude 工作目录（默认当前目录）")
+    p_chat.add_argument("--agent", default="claude", help="选择 AI agent (默认: claude)")
+
+    # ── agents ──
+    p_agents = subparsers.add_parser(
+        "agents",
+        help="列出已注册 agent 及其可用性",
+        description="列出所有已注册的 AI agent runner, 显示名称和是否可用 (二进制是否在 PATH 中)。",
+    )
+    p_agents_sub = p_agents.add_subparsers(dest="agents_command", title="agents 动作", metavar="<动作>")
+    p_agents_sub.add_parser("list", help="列出所有已注册 agent + 是否可用")
 
     return parser
 
@@ -593,6 +647,8 @@ def main():
         cmd_schedule(args)
     elif args.command == "state":
         cmd_state(args)
+    elif args.command == "agents":
+        cmd_agents(args)
     elif args.command == "chat":
         from mailcode.cli_chat import cmd_chat
         cmd_chat(args)

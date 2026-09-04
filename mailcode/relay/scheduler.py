@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import Optional
 
 from mailcode.config import get_schedule_config
-from mailcode.utils.claude_runner import call_claude
 
 logger = logging.getLogger(__name__)
 
@@ -158,11 +157,15 @@ class Task:
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     timeout_seconds: Optional[int] = None
+    agent: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
         # schedule 嵌套对象展开为 dict
         d["schedule"] = self.schedule.to_dict()
+        # agent 为 None 时不写入 (保持向后兼容)
+        if self.agent is None:
+            d.pop("agent", None)
         return d
 
     @classmethod
@@ -185,6 +188,7 @@ class Task:
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
             timeout_seconds=d.get("timeout_seconds"),
+            agent=d.get("agent"),
         )
 
 
@@ -716,7 +720,7 @@ class Scheduler(threading.Thread):
             logger.info("Scheduler dry-run: 不调 Claude, 不发邮件, id=%s", task.id)
             return True, None
 
-        # 调 Claude
+        # 调 agent (claude / pi / ...)
         # timeout: task 自身字段优先, 否则从 config 取默认值, 最后兜底 1800s
         if task.timeout_seconds is not None:
             effective_timeout = task.timeout_seconds
@@ -724,17 +728,27 @@ class Scheduler(threading.Thread):
             cfg = get_schedule_config()
             effective_timeout = cfg.get("default_timeout_seconds", 1800)
         try:
-            claude_output = call_claude(task.prompt, task.cwd, timeout=effective_timeout)
+            from mailcode.utils.agent import get_runner, AgentNotFoundError
+            agent_name = task.agent or "claude"
+            runner = get_runner(agent_name)
+        except AgentNotFoundError as e:
+            err = str(e)
+            logger.error("Scheduler task agent 未找到: id=%s: %s", task.id, err)
+            self.store.mark_run(task.id, STATUS_FAILED, error=err, now=now)
+            self._send_error_email(task, err)
+            return False, err
+        try:
+            claude_output = runner.call(task.prompt, task.cwd, timeout=effective_timeout)
         except Exception as e:
-            err = f"call_claude 异常: {e}"
-            logger.error("Scheduler call_claude 失败 id=%s: %s", task.id, e)
+            err = f"{runner.name} 异常: {e}"
+            logger.error("Scheduler %s 失败 id=%s: %s", runner.name, task.id, e)
             self.store.mark_run(task.id, STATUS_FAILED, error=err, now=now)
             self._send_error_email(task, err)
             return False, err
 
         if claude_output is None:
-            err = "call_claude 返回 None (失败/超时/未找到)"
-            logger.error("Scheduler call_claude 返回 None id=%s", task.id)
+            err = f"{runner.name} 返回 None (失败/超时/未找到)"
+            logger.error("Scheduler %s 返回 None id=%s", runner.name, task.id)
             self.store.mark_run(task.id, STATUS_FAILED, error=err, now=now)
             self._send_error_email(task, err)
             return False, err
@@ -824,4 +838,5 @@ def _with_next_run(task: Task, next_run_iso: str) -> Task:
         next_run_at=next_run_iso,
         created_at=task.created_at,
         updated_at=task.updated_at,
+        agent=task.agent,
     )
