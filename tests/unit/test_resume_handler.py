@@ -32,6 +32,9 @@ def handler(mock_email_channel, temp_data_dir):
     agent_dir = temp_data_dir / "claude"
     transcripts_dir = agent_dir / "transcripts"
     mapping_file = agent_dir / "sessions.json"
+    # legacy 映射也指向临时目录 (默认不存在), 否则 fallback 会读到
+    # ~/.config/mailcode/claude_sessions.json 里的真实数据, 断言随机被污染
+    legacy_mapping_file = temp_data_dir / "claude_sessions.json"
 
     def _paths_conversations_dir(agent):
         return agent_dir
@@ -45,9 +48,14 @@ def handler(mock_email_channel, temp_data_dir):
     def _paths_agent_home(agent):
         return agent_dir
 
+    def _paths_legacy_sessions_file():
+        return legacy_mapping_file
+
     with patch.object(paths, "agent_home", side_effect=_paths_agent_home), \
          patch.object(paths, "transcripts_dir", side_effect=_paths_transcripts_dir), \
-         patch.object(paths, "sessions_file", side_effect=_paths_sessions_file):
+         patch.object(paths, "sessions_file", side_effect=_paths_sessions_file), \
+         patch.object(paths, "legacy_sessions_file",
+                      side_effect=_paths_legacy_sessions_file):
         h = ResumeConversationHandler(email_channel=mock_email_channel)
         yield h
 
@@ -64,6 +72,29 @@ class TestMappingIO:
         """文件不存在 → 返回空文档。"""
         mapping = handler._load_mapping()
         assert mapping == {"version": 1, "threads": {}}
+
+    def test_load_mapping_legacy_fallback(self, handler, temp_data_dir):
+        """新路径不存在时, claude agent 回落到 legacy claude_sessions.json。"""
+        (temp_data_dir / "claude_sessions.json").write_text(
+            json.dumps({"threads": {"<m@t>": {"claude_session_id": "legacy-1"}}}),
+            encoding="utf-8",
+        )
+
+        mapping = handler._load_mapping()
+
+        assert list(mapping["threads"]) == ["<m@t>"]
+
+    def test_load_mapping_new_path_wins_over_legacy(self, handler, temp_data_dir):
+        """新路径已存在时不再读 legacy (legacy 只作 fallback)。"""
+        (temp_data_dir / "claude_sessions.json").write_text(
+            json.dumps({"threads": {"<legacy@t>": {"claude_session_id": "old"}}}),
+            encoding="utf-8",
+        )
+        handler._save_mapping({"version": 1, "threads": {}})
+
+        mapping = handler._load_mapping()
+
+        assert mapping["threads"] == {}
 
     def test_load_mapping_corrupt(self, handler, temp_data_dir):
         """损坏的 JSON → 返回空文档 + warn。"""

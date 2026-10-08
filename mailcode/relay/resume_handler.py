@@ -21,13 +21,6 @@ from mailcode.utils import paths
 
 logger = logging.getLogger(__name__)
 
-# MailCode 主目录
-_MAILCODE_HOME = Path.home() / ".config" / "mailcode"
-
-# ---- Legacy 路径 (claude agent 读 fallback 用, 不再写入) ----
-_LEGACY_TRANSCRIPTS_DIR = _MAILCODE_HOME / "transcripts"
-_LEGACY_MAPPING_FILE = _MAILCODE_HOME / "claude_sessions.json"
-
 
 class ResumeConversationHandler:
     """通过 claude --session-id/--resume 处理对话邮件。
@@ -69,9 +62,10 @@ class ResumeConversationHandler:
         mapping_file = paths.sessions_file(self.agent_name)
         if not mapping_file.exists():
             # Legacy fallback: claude agent 且新路径不存在时读旧路径
-            if self.agent_name == "claude" and _LEGACY_MAPPING_FILE.exists():
+            legacy_file = paths.legacy_sessions_file()
+            if self.agent_name == "claude" and legacy_file.exists():
                 try:
-                    with open(_LEGACY_MAPPING_FILE, "r", encoding="utf-8") as f:
+                    with open(legacy_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     if isinstance(data.get("threads"), dict):
                         data.setdefault("version", 1)
