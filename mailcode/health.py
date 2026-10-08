@@ -136,7 +136,7 @@ def run_health(send_test: bool = True) -> bool:
         for agent_name in list_agents():
             runner = get_runner(agent_name)
             if runner.is_available():
-                _check(f"  {agent_name}", True, f"✓")
+                _check(f"  {agent_name}", True, "✓")
             else:
                 _check(f"  {agent_name}", False, runner.hint_for_failure())
     except Exception:
