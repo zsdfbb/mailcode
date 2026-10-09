@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import select
 import socket
 import ssl
 import sys
@@ -31,10 +32,247 @@ if TYPE_CHECKING:
 logger = logging.getLogger("mailcode")
 
 imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
+# IDLE 不在 stdlib imaplib 的 Commands 表里, 但 RFC 2177 允许它在 SELECTED 状态下执行。
+# 3.14+ 的 _command 会用它, 兼容层也要用它, 必须先注册。
+imaplib.Commands.setdefault("IDLE", ("NONAUTH", "AUTH", "SELECTED"))
 
-# Python 3.13+ 把 IMAP IDLE 改成 context manager (`with M.idle() as idler:`),
-# 旧的 `mail.idle_response()` / `mail.idle_done()` 被移除. 这里用特征方法探测.
-_NEW_IDLE_API: bool = not hasattr(imaplib.IMAP4, "idle_response")
+
+# ---------------------------------------------------------------------------
+# imaplib IDLE 兼容层
+# ---------------------------------------------------------------------------
+# 背景: stdlib imaplib 直到 3.14 (gh-55454) 才加入 IMAP4.idle(duration=...) 上下文管理器。
+# 3.13 及更早版本连旧版 mail.idle()/idle_response()/idle_done() 都没有, 任何
+# "IMAP4 idle" 调用都会 AttributeError。这里手搓一个 RFC 2177 IDLE 实现, 在
+# stdlib 缺失时装到 imaplib.IMAP4.idle 上, 调用方完全无感。
+# 实现要点: 用 imap._command('IDLE') 发命令, 用 select + imap._get_line 自管
+# 读循环, 自己解析 untagged/tagged/continuation; __exit__ 写 DONE 并用
+# imap._command_complete 收尾。接口形状刻意对齐 3.14 的 Idler 上下文管理器。
+class _CompatIdler:
+    """RFC 2177 IDLE 的 stdlib 兼容实现, 接口对齐 Python 3.14 的 IMAP4.idle。
+
+    用法:
+        with mail.idle(duration=5) as idler:
+            for typ, data in idler:
+                ...  # typ ∈ {'EXISTS','RECENT','EXPUNGE',...}
+
+    实现要点:
+    - 完全绕过 m._get_line / m._get_response (它们走 m.file 的 buffered
+      reader, 字节被 m.file 提前读走后 select(m.sock) 看不到, 会把可用
+      数据当成"超时"误判). 改为直接 m.sock.recv + 自维护跨 recv 的行 buffer.
+    - 只在发命令时用 m._command / m.send (这两条走 socket, 与 m.file 无关).
+    - 与 stdlib 协议状态机兼容: untagged 仍写 m.untagged_responses (经
+      m._append_untagged), IDLE 的 tagged 完成写 m.tagged_commands, 这样
+      后续 mail.uid / mail.noop 等仍能正常用 m._get_response 解析 (m.file
+      此时是干净的, 我们的 _buf 不会泄漏).
+    """
+
+    _MAX_RECV = 65536  # 单次 recv 上限, 与 imaplib 默认 _MAXLINE 对齐
+
+    def __init__(self, imap: "imaplib.IMAP4", duration: Optional[float]):
+        self._imap = imap
+        self._duration = duration
+        self._tag: Optional[bytes] = None
+        self._deadline: Optional[float] = None
+        self._buf = b""  # 跨 recv 的行 buffer
+        self._stopped = False  # 服务器或客户端终结 IDLE 后置位, 阻止再读
+
+    def __enter__(self) -> "_CompatIdler":
+        m = self._imap
+        self._tag = m._command("IDLE")
+        # 读到 "+ IDLE" 续传提示为止. 注: imaplib 的 Untagged_response /
+        # Continuation / Untagged_status 是模块级常量, 实例没有同名属性,
+        # 必须从 imaplib 模块取. Untagged_response 匹配 `* TYPE DATA` 形
+        # (FLAGS / FETCH / LIST 等), Untagged_status 匹配 `* NUM TYPE` 形
+        # (EXISTS / RECENT / EXPUNGE), 两者都得试, 否则一遇常见通知就抛.
+        while True:
+            line = self._readline()
+            if m._match(imaplib.Continuation, line):
+                m.continuation_response = m.mo.group("data")
+                break
+            if m._match(m.tagre, line):
+                # 服务器直接给 tagged (拒绝/BYE) 而不是 "+ IDLE" 续传
+                tag = m.mo.group("tag")
+                typ = str(m.mo.group("type"), m._encoding, "replace")
+                dat = m.mo.group("data")
+                m.tagged_commands[tag] = (typ, [dat])
+                raise m.error("IDLE 被服务器拒绝: %s" % typ)
+            typ, dat = self._classify(line)
+            if typ is not None:
+                m._append_untagged(typ, dat)
+                continue
+            raise m.abort("IDLE 握手遇到意外响应: %r" % line)
+
+        if self._duration is not None:
+            self._deadline = time.monotonic() + self._duration
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        m = self._imap
+        if self._stopped:
+            return False
+        try:
+            m.send(b"DONE\r\n")
+        except Exception:
+            return False
+        # 阻塞读 tagged 完成响应 (我们自己 parse, 不调 m._command_complete,
+        # 后者走 m._get_response → m._get_line → m.file, 而我们读过的字节
+        # 都在 m.sock / m.file 干净状态, 此时 m.file 还没看到任何字节, 直接
+        # 让 _get_response 接管剩下的 tagged 是错的; 改成自读自解析).
+        try:
+            while True:
+                line = self._readline()
+                if m._match(m.tagre, line):
+                    tag = m.mo.group("tag")
+                    typ = str(m.mo.group("type"), m._encoding, "replace")
+                    dat = m.mo.group("data")
+                    m.tagged_commands[tag] = (typ, [dat])
+                    break
+                # 收尾过程中可能还有未消费 untagged (例如服务器端在 DONE 之前
+                # 推送的 EXISTS), 存起来, 不影响 IMAP 状态.
+                typ, dat = self._classify(line)
+                if typ is not None:
+                    m._append_untagged(typ, dat)
+                    continue
+                # 续传不该出现; 跳过
+        except Exception:
+            pass
+        return False
+
+    def __iter__(self) -> "_CompatIdler":
+        return self
+
+    def __next__(self) -> Tuple[str, bytes]:
+        # _pop 自身在以下两种情况返回 None:
+        #   1) select 超时: 正常的 duration 到期, 不应终结 IDLE, 也不应标
+        #      _stopped, 否则 __exit__ 会跳过发 DONE.
+        #   2) 收到服务器终结 tagged: 此时 _pop 已把 tagged 写入
+        #      m.tagged_commands 并把 _stopped 置 True, 这次 StopIteration
+        #      之后 __exit__ 也不应再发 DONE.
+        # 把"是否要发 DONE"完全交给 __exit__, 这里只负责把"没数据"翻译成
+        # StopIteration 让 for 循环退出.
+        item = self._pop()
+        if item is None:
+            raise StopIteration
+        return item
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+    def _remaining(self) -> Optional[float]:
+        if self._deadline is None:
+            return None
+        rem = self._deadline - time.monotonic()
+        return rem if rem > 0 else 0.0
+
+    def _readline(self) -> bytes:
+        """从 m.sock 直接读一行 (CRLF 结尾). 跨 recv 拼接."""
+        m = self._imap
+        sock = m.sock
+        if sock is None:
+            raise OSError("imap socket 已关闭")
+        while b"\r\n" not in self._buf:
+            chunk = sock.recv(self._MAX_RECV)
+            if not chunk:
+                raise m.abort("IDLE socket EOF")
+            self._buf += chunk
+        line, _, self._buf = self._buf.partition(b"\r\n")
+        return line
+
+    def _classify(self, line: bytes) -> Tuple[Optional[str], bytes]:
+        """把一行 untagged 响应解析成 (typ, dat).
+
+        覆盖两种 RFC 3501 形式:
+        - `* TYPE DATA` (FLAGS / FETCH / LIST 等): Untagged_response 匹配
+        - `* NUM TYPE [DATA2]` (EXISTS / RECENT / EXPUNGE): Untagged_status
+          匹配, 拼接成 "NUM" 作为 dat (与 imaplib 内部一致)
+        都用 imaplib 自己的正则, 行为/边界与 stdlib 对齐.
+        返回 (None, b'') 表示这行不是 untagged, 调用方应继续走 tagged /
+        continuation 分支.
+        """
+        m = self._imap
+        if m._match(imaplib.Untagged_response, line):
+            typ = m.mo.group("type").decode(m._encoding, "replace")
+            dat = m.mo.group("data") or b""
+            return typ, dat
+        if m._match(m.Untagged_status, line):
+            typ = m.mo.group("type").decode(m._encoding, "replace")
+            num = m.mo.group("data")  # bytes (re.ASCII 模式)
+            dat2 = m.mo.group("data2") or b""
+            dat = num + (b" " + dat2 if dat2 else b"")
+            return typ, dat
+        return None, b""
+
+    def _pop(self) -> Optional[Tuple[str, bytes]]:
+        """阻塞等待下一条 untagged 响应; 超时返回 None. 服务器终结时把
+        终结响应写进 imap.tagged_commands 并返回 None."""
+        if self._stopped:
+            return None
+        m = self._imap
+        sock = m.sock
+        if sock is None:
+            return None
+        # 已有缓存数据可读 (上次 recv 留下的尾巴)
+        if b"\r\n" in self._buf:
+            pass
+        else:
+            timeout = self._remaining()
+            rlist, _, _ = select.select([sock], [], [], timeout)
+            if not rlist:
+                return None
+        while not self._stopped:
+            try:
+                line = self._readline()
+            except (m.abort, OSError, EOFError):
+                raise
+            if m._match(imaplib.Continuation, line):
+                continue
+            if m._match(m.tagre, line):
+                tag = m.mo.group("tag")
+                typ = str(m.mo.group("type"), m._encoding, "replace")
+                dat = m.mo.group("data")
+                m.tagged_commands[tag] = (typ, [dat])
+                # 终结信号: 服务器已主动关闭 IDLE, 后续 __next__ / __exit__
+                # 不应再做任何 socket 读取.
+                self._stopped = True
+                return None
+            typ, dat = self._classify(line)
+            if typ is not None:
+                m._append_untagged(typ, dat)
+                return (typ, dat)
+            raise m.abort("IDLE 期间遇到意外响应: %r" % line)
+        return None
+
+
+def _idle(self: "imaplib.IMAP4", duration: Optional[float] = None) -> _CompatIdler:
+    """imaplib.IMAP4.idle 的兼容实现入口.
+
+    校验 capabilities 包含 IDLE (避免对不支持的服务器发错命令), 其它事
+    都交给 _CompatIdler.
+    """
+    caps = self.capabilities or ()
+    if "IDLE" not in caps:
+        raise self.error("服务器未声明 IDLE capability")
+    return _CompatIdler(self, duration)
+
+
+def _install_idle_compat() -> None:
+    """把 _idle 装到 imaplib.IMAP4 上, 仅当 stdlib 还没提供 idle() 时生效.
+
+    模块导入时自动调用; 显式再调一次是幂等的. 测试可重复调用而不打架.
+    """
+    if hasattr(imaplib.IMAP4, "idle"):
+        return
+    imaplib.IMAP4.idle = _idle  # type: ignore[attr-defined]
+
+
+_install_idle_compat()
+
+
+# 现在所有 Python 版本 (>= 3.9) 都有 mail.idle(duration=...) 可用. 旧的
+# _NEW_IDLE_API 探测原本是 "idle_response 不存在 ⇒ 新 API", 但 3.13 既没
+# 旧 API 也没新 API, 探测永远是 True (走"新"路径然后 AttributeError).
+# 既然兼容层统一了 API, 永远走新路径, 保留这个标志仅给旧测试引用.
+_NEW_IDLE_API: bool = True
 
 _MAILCODE_HOME = Path.home() / ".config" / "mailcode"
 
@@ -394,14 +632,10 @@ class IMAPListener:
     def _wait_for_idle(self, mail: imaplib.IMAP4_SSL) -> bool:
         """阻塞等待 IMAP IDLE 事件. 返回 True=收到事件, False=超时/异常.
 
-        按 imaplib 版本分两条路径:
-        - 旧 API: 起一个守护线程跑 `mail.idle()` + `idle_response()`, 主线程 wait event.
-        - 新 API (3.13+): 主线程直接 `with mail.idle(duration=...)` 同步等待,
-          超时由 duration 控制, SIGINT 最多延迟 _idle_timeout 秒.
+        stdlib imaplib 从 3.14 (gh-55454) 起提供 `with mail.idle(duration=...)`;
+        3.9~3.13 完全没有 IDLE API, 模块加载时已装上 `_idle` 兼容层, 行为一致.
         """
-        if _NEW_IDLE_API:
-            return self._wait_for_idle_new(mail)
-        return self._wait_for_idle_old(mail)
+        return self._wait_for_idle_new(mail)
 
     def _wait_for_idle_old(self, mail: imaplib.IMAP4_SSL) -> bool:
         if self._idle_thread and self._idle_thread.is_alive():
@@ -445,8 +679,9 @@ class IMAPListener:
         return got_event
 
     def _wait_for_idle_new(self, mail: imaplib.IMAP4_SSL) -> bool:
-        """Py3.13+ IDLE 路径: 同步 `with mail.idle(duration=...)` 等待.
+        """IDLE 路径: `with mail.idle(duration=...)` 同步等待.
 
+        stdlib 3.14+ 用原生 IMAP4.idle, 3.9~3.13 走模块自带的 _idle 兼容层.
         duration 让 IDLE 迭代器在最多 `_idle_timeout` 秒后自然 StopIteration;
         连接级异常向上抛, 由 `_listen_idle` 的退避循环重连.
         """

@@ -1,4 +1,7 @@
 """IMAPListener 生命周期测试 —— stop()、IDLE 回退、循环退出"""
+import threading
+import time
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1430,3 +1433,259 @@ class TestIdleDenied:
         with open(listener.state_path, encoding="utf-8") as f:
             data = json_mod.load(f)
         assert set(data) >= {"processed_uids", "sent_messages", "highest_seen_uid", "uid_validity"}
+
+
+# ---------------------------------------------------------------------------
+# IDLE 兼容层测试 (RFC 2177 协议回放)
+# ---------------------------------------------------------------------------
+# Python <3.14 的 stdlib imaplib 完全没有 IDLE 实现, mailcode 模块加载时会
+# 自装 _idle 兼容层。下面用 socketpair 模拟 IMAP 服务器, 验证兼容层能:
+#   1. 正确发出 "A1 IDLE\r\n" 并消费 "+" 续传
+#   2. 读 untagged EXISTS 等响应并 yield (typ, data)
+#   3. __exit__ 时发 DONE 并消费 tagged 完成响应
+# 这条接缝在原实现里是空白的 (用 MagicMock 永远走不到真协议), 是
+# mailcode 在 3.13 上 IDLE 每 5 秒刷 AttributeError 的根因所在.
+class TestIdleCompat:
+    @staticmethod
+    def _make_idle_client(capabilities=("IDLE",)):
+        """构造一个不连真服务器的 IMAP4 客户端, 用 socketpair 模拟链路."""
+        import imaplib
+        import re
+        import socket as _socket
+        imap = imaplib.IMAP4_SSL.__new__(imaplib.IMAP4_SSL)
+        # 直接调 _mode_ascii() 装好 _encoding / Literal / Untagged_status, 再
+        # 补齐 __init__ 在未真正 open socket 之前会设的全部属性. socket
+        # 用 socketpair 替代, 避免真连服务器.
+        imap._mode_ascii()
+        imap.untagged_responses = {}
+        imap.tagged_commands = {}
+        imap.continuation_response = ""
+        imap.capabilities = tuple(capabilities)
+        imap.state = "SELECTED"
+        imap.debug = 0
+        imap.literal = None
+        imap.is_readonly = False
+        imap.tagpre = b"A"
+        imap.tagnum = 0
+        # tagre 是 _connect() 用 tagpre 编译的实例属性, 这里手动复刻
+        imap.tagre = re.compile(
+            br'(?P<tag>A\d+) (?P<type>[A-Z]+) (?P<data>.*)', re.ASCII
+        )
+        imap._cmd_log = {}
+        imap._cmd_log_idx = 0
+        imap._cmd_log_len = 10
+        imap._tls_established = True
+        imap.PROTOCOL_VERSION = "IMAP4REV1"
+        server_sock, client_sock = _socket.socketpair()
+        imap.sock = client_sock
+        # imaplib._get_line() 走 self.file.readline, 需把 sock 包成 buffered file
+        imap.file = client_sock.makefile("rb")
+        return imap, server_sock
+
+    @staticmethod
+    def _recv_until_timeout(sock, deadline=0.5):
+        """读到 socket 关闭或 deadline 到期, 返回累积 bytes."""
+        import socket as _socket
+        sock.settimeout(0.1)
+        buf = b""
+        end = time.monotonic() + deadline
+        while time.monotonic() < end:
+            try:
+                chunk = sock.recv(4096)
+            except _socket.timeout:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+            if b"DONE" in buf:
+                # DONE 后等一会儿收尾, 然后退出
+                if b"\r\n" in buf.split(b"DONE", 1)[1]:
+                    break
+        return buf
+
+    def test_idle_installed_on_imap4(self):
+        """模块加载后 imaplib.IMAP4.idle 一定存在 (3.14 原生, 老版本走兼容层)."""
+        import imaplib
+        from mailcode.relay.email_listener import _install_idle_compat
+        _install_idle_compat()  # 幂等
+        assert hasattr(imaplib.IMAP4, "idle")
+        assert callable(imaplib.IMAP4.idle)
+
+    def test_idle_rejects_when_no_capability(self):
+        """服务器未声明 IDLE capability 时, mail.idle() 应抛 IMAP4.error."""
+        import imaplib
+        imap, server_sock = self._make_idle_client(capabilities=("IMAP4rev1",))
+        try:
+            with pytest.raises(imaplib.IMAP4.error):
+                imap.idle(duration=0.5)
+        finally:
+            server_sock.close()
+            try:
+                imap.sock.close()
+            except Exception:
+                pass
+
+    def test_idle_yields_untagged_then_sends_done(self):
+        """IDLE 收到 EXISTS 时 yield (typ, data); __exit__ 发 DONE 并收 tagged.
+
+        后台线程扮演 IMAP server, 真实地响应客户端: 收到 IDLE 后回 +, 收到
+        DONE 后回 tagged. 比纯预喂更接近真实协议, 也能避开"__exit__ 等 tagged
+        时测试主线程被卡住"这类死锁.
+        """
+        imap, server_sock = self._make_idle_client()
+        server_thread = self._start_server(
+            server_sock,
+            after_idle=b"+ idling\r\n* 5 EXISTS\r\n",
+            after_done=b"A0 OK IDLE completed\r\n",
+        )
+        try:
+            with imap.idle(duration=2.0) as idler:
+                got = next(idler)
+                assert got == ("EXISTS", b"5"), got
+
+            # 退出后, 服务器线程应已收到 DONE 并回了 tagged
+            server_thread.join(timeout=2.0)
+            assert not server_thread.is_alive(), "服务器线程未在 2s 内退出"
+            assert imap.tagged_commands.get(b"A0") == ("OK", [b"IDLE completed"])
+            assert imap.untagged_responses.get("EXISTS") == [b"5"]
+        finally:
+            try:
+                imap.sock.close()
+            except Exception:
+                pass
+            try:
+                server_sock.close()
+            except Exception:
+                pass
+
+    def test_idle_iteration_exits_on_timeout(self):
+        """duration 到期时迭代器 StopIteration, 仍正常发 DONE 收尾."""
+        imap, server_sock = self._make_idle_client()
+        server_thread = self._start_server(
+            server_sock,
+            after_idle=b"+ idling\r\n",
+            after_done=b"A0 OK IDLE terminated\r\n",
+        )
+        try:
+            with imap.idle(duration=0.1) as idler:
+                with pytest.raises(StopIteration):
+                    next(idler)
+                # duration 已过, 再次 next 仍 StopIteration
+                with pytest.raises(StopIteration):
+                    next(idler)
+
+            server_thread.join(timeout=2.0)
+            assert not server_thread.is_alive()
+            assert imap.tagged_commands.get(b"A0") == ("OK", [b"IDLE terminated"])
+        finally:
+            try:
+                imap.sock.close()
+            except Exception:
+                pass
+            try:
+                server_sock.close()
+            except Exception:
+                pass
+
+    def test_idle_handles_server_terminated(self):
+        """服务器主动给 tagged (如 BYE) 终结 IDLE 时, 迭代器停止且不再发 DONE."""
+        imap, server_sock = self._make_idle_client()
+        # 服务器进入 IDLE 后立刻给 tagged 终结; 不期望客户端再发 DONE
+        self._start_server(
+            server_sock,
+            after_idle=b"+ idling\r\nA0 OK IDLE done\r\n",
+            after_done=None,  # 不再回, 客户端应识别服务器已终结
+        )
+        try:
+            with imap.idle(duration=2.0) as idler:
+                with pytest.raises(StopIteration):
+                    next(idler)
+                # 服务器已终结, 迭代器应标记 stopped; 再次 next 仍 StopIteration
+                with pytest.raises(StopIteration):
+                    next(idler)
+        finally:
+            try:
+                imap.sock.close()
+            except Exception:
+                pass
+            try:
+                server_sock.close()
+            except Exception:
+                pass
+
+    def test_idle_via_wait_for_idle_new(self):
+        """生产路径 _wait_for_idle_new 走通: 收到事件返回 True, 超时返回 False.
+
+        整合: 用 listener 实例 + 真实 IDLE 协议回放, 验证邮件监听主循环不再
+        抛 AttributeError (历史 Bug: 3.13 stdlib 缺 idle).
+        """
+        from mailcode.relay.email_listener import IMAPListener
+
+        imap, server_sock = self._make_idle_client()
+        try:
+            listener = IMAPListener.__new__(IMAPListener)
+            listener._idle_timeout = 2.0
+            listener._active_idle_mail = None
+            listener._stopped = threading.Event()
+            listener._mail = imap
+            listener._idle_thread = None
+
+            # 1) 收到 RECENT → True
+            server_thread = self._start_server(
+                server_sock,
+                after_idle=b"+ idling\r\n* 7 RECENT\r\n",
+                after_done=b"A0 OK IDLE done\r\n",
+            )
+            assert listener._wait_for_idle_new(imap) is True
+            server_thread.join(timeout=2.0)
+
+            # 2) 续推 + 让 RECENT 已被消费, 接着持续空闲 → 超时 False
+            server_thread2 = self._start_server(
+                server_sock,
+                after_idle=b"+ idling\r\n",
+                after_done=b"A0 OK IDLE done\r\n",
+            )
+            listener._idle_timeout = 0.1
+            assert listener._wait_for_idle_new(imap) is False
+            server_thread2.join(timeout=2.0)
+        finally:
+            try:
+                listener._active_idle_mail = None
+            except Exception:
+                pass
+            try:
+                imap.sock.close()
+            except Exception:
+                pass
+            try:
+                server_sock.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _start_server(server_sock, after_idle: bytes, after_done: Optional[bytes]):
+        """起一个后台线程, 模拟 IMAP server 响应 IDLE 协议.
+
+        - 立即把 after_idle 字节推给客户端 (这是 IDLE 入口的续传 + 任意
+          伴随的 untagged 通知)
+        - 阻塞读客户端, 一旦看到 "DONE" 就把 after_done 推回去 (None 时
+          不回, 模拟服务器主动终结), 然后退出
+        """
+        def serve():
+            try:
+                server_sock.sendall(after_idle)
+                if after_done is None:
+                    return
+                server_sock.settimeout(2.0)
+                buf = b""
+                while b"DONE" not in buf:
+                    chunk = server_sock.recv(4096)
+                    if not chunk:
+                        return
+                    buf += chunk
+                server_sock.sendall(after_done)
+            except Exception:
+                pass
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        return t
